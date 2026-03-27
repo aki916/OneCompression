@@ -44,7 +44,11 @@ def _run_onecomp(*args, timeout=TIMEOUT):
     """
     cmd = [sys.executable, "-m", "onecomp", *args]
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, cwd=_PROJECT_ROOT,
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=_PROJECT_ROOT,
     )
 
 

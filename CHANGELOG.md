@@ -1,5 +1,15 @@
 # Change log
 
+## [v0.4.4] 2026-03-27
+
+### Unit test updates for DBF and GPTQ
+
+- Expanded and updated unit tests for DBF quantizer (`tests/onecomp/quantizer/dbf/test_dbf.py`)
+  - Extended boundary and abnormal parameter cases; aligned with `BaseQuantizeSpec` and current DBF API
+- Expanded and updated unit tests for GPTQ quantizer (`tests/onecomp/quantizer/gptq/test_gptq.py`)
+  - Extended boundary and abnormal parameter cases; aligned with `BaseQuantizeSpec` and current GPTQ API
+- Adjusted DBF and GPTQ quantizer implementations for test compatibility and consistency (`onecomp/quantizer/dbf/_dbf.py`, `onecomp/quantizer/gptq/_gptq.py`)
+
 ## [v0.4.3] 2026-03-26
 
 ### Implement AutoBit to automatically determine bit-allocation
@@ -182,7 +192,6 @@
   - Aligns with the base `Quantizer.quantize_layer(self, module, input=None, hessian=None)` signature
   - Enables these quantizers to be used in `Runner(quantizers=[...])` via the chunked quantization path
 - Added `input=None, hessian=None` defaults to `Onebit.quantize_layer` for the same reason
-
 
 ## [v0.3.7] 2026-03-16
 

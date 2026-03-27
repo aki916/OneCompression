@@ -30,10 +30,45 @@ class TestDBF(BaseQuantizeSpec):
         "balance_iters": 1,
     }
     boundary_parameters = [
-        {"target_bits": 4.0},
-        {"balance_mode": "l2"},
+        # target_bits: float > 0 (validated by validate_params), no explicit upper
+        {"target_bits": 1e-10},  # target_bits lower boundary (near zero, positive)
+        {"target_bits": 100.0},  # target_bits large value (no explicit upper bound)
+        # iters: int >= 1 (validated by validate_params), no explicit upper
+        {"iters": 1},  # iters lower boundary
+        {"iters": 100},  # iters large value (no explicit upper bound)
+        # reg: float >= 0 (validated by validate_params), no explicit upper
+        {"reg": 0.0},  # reg lower boundary
+        {"reg": 100.0},  # reg large value (no explicit upper bound)
+        # use_balancing: bool
+        {"use_balancing": True},
         {"use_balancing": False},
+        # balance_iters: int >= 1 when use_balancing=True (validated by validate_params)
+        {"balance_iters": 1},  # balance_iters lower boundary (use_balancing=True default)
+        {"balance_iters": 100},  # balance_iters large value (no explicit upper bound)
+        # balance_iters: not validated when use_balancing=False
+        {"use_balancing": False, "balance_iters": 0},  # balance_iters=0 allowed when balancing off
+        # balance_alpha: float > 0 when use_balancing=True (validated by validate_params)
+        {"balance_alpha": 1e-10},  # balance_alpha lower boundary (near zero, positive)
+        {"balance_alpha": 100.0},  # balance_alpha large value (no explicit upper bound)
+        # balance_alpha: not validated when use_balancing=False
+        {
+            "use_balancing": False,
+            "balance_alpha": 0.0,
+        },  # balance_alpha=0 allowed when balancing off
+        # balance_mode: str in {l1, l2} when use_balancing=True (validated by validate_params)
+        {"balance_mode": "l1"},
+        {"balance_mode": "l2"},
+        # balance_mode: not validated when use_balancing=False
+        {
+            "use_balancing": False,
+            "balance_mode": "invalid",
+        },  # invalid mode allowed when balancing off
+        # use_adaptive_rho: bool
+        {"use_adaptive_rho": True},
+        {"use_adaptive_rho": False},
+        # combo: bools False
         {"use_balancing": False, "use_adaptive_rho": False},
+        # combo: numerics at lower bounds
         {
             "target_bits": 1.0,
             "iters": 1,
@@ -41,13 +76,48 @@ class TestDBF(BaseQuantizeSpec):
             "balance_iters": 1,
             "balance_alpha": 1.0,
         },
+        # all class defaults
+        {
+            "target_bits": 1.5,
+            "iters": 600,
+            "reg": 3e-2,
+            "use_balancing": True,
+            "balance_iters": 40,
+            "balance_alpha": 1.0,
+            "balance_mode": "l1",
+            "use_adaptive_rho": True,
+        },
+        # all minimum (use_balancing=False skips balance_* validation)
+        {
+            "target_bits": 1e-10,
+            "iters": 1,
+            "reg": 0.0,
+            "use_balancing": False,
+            "balance_iters": 0,
+            "balance_alpha": 1e-10,
+            "balance_mode": "l1",
+            "use_adaptive_rho": False,
+        },
+        # all maximum
+        {
+            "target_bits": 100.0,
+            "iters": 100,
+            "reg": 100.0,
+            "use_balancing": True,
+            "balance_iters": 100,
+            "balance_alpha": 100.0,
+            "balance_mode": "l2",
+            "use_adaptive_rho": True,
+        },
     ]
     abnormal_parameters = [
-        {"target_bits": -1.0},
-        {"iters": -1},
-        {"reg": -1.0},
-        {"balance_iters": -1},
-        {"balance_alpha": -1.0},
+        {"target_bits": 0.0},  # boundary value (target_bits > 0, strict)
+        {"iters": 0},  # below lower boundary (iters >= 1)
+        {"reg": -0.01},  # below lower boundary (reg >= 0)
+        {"balance_iters": 0},  # below lower boundary (balance_iters >= 1 when use_balancing=True)
+        {"balance_iters": -1},  # below lower boundary (balance_iters >= 1 when use_balancing=True)
+        {"balance_alpha": 0.0},  # boundary value (balance_alpha > 0 when use_balancing=True)
+        {"balance_mode": "invalid"},  # not in {l1, l2} when use_balancing=True
     ]
     logger = logging.getLogger(__name__)
 

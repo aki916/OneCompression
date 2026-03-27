@@ -220,41 +220,49 @@ class GPTQ(Quantizer):
         super().__post_init__()
 
     def validate_params(self):
-        """Validate GPTQ parameters once in setup()."""
+        """Validate GPTQ parameters once in setup().
+
+        Validated ranges:
+            blocksize: int >= 1
+            percdamp: float >= 3.95e-4
+            wbits: int, 1 <= wbits <= 63
+            groupsize: int, -1 or >= 1
+            q_grid: int >= 1 (when mse=True)
+            q_norm: float > 0 (when mse=True)
+        """
         bad = []
 
         if not (isinstance(self.blocksize, int) and self.blocksize >= 1):
             bad.append(
-                f"Invalid GPTQ parameter 'blocksize': {self.blocksize!r} (expected int >= 1)"
+                f"Invalid GPTQ parameter 'blocksize': {self.blocksize!r} (expected int >= 1)."
             )
 
         if not (isinstance(self.percdamp, (int, float)) and self.percdamp >= 3.95e-4):
             bad.append(
-                f"Invalid GPTQ parameter 'percdamp': {self.percdamp!r} "
-                f"(expected numeric >= 3.95e-4)"
+                f"Invalid GPTQ parameter 'percdamp': {self.percdamp!r} (expected numeric >= 3.95e-4)."
             )
 
-        if not (isinstance(self.wbits, int) and 1 <= self.wbits <= 64):
-            bad.append(f"Invalid GPTQ parameter 'wbits': {self.wbits!r} (expected int in 1..64)")
+        if not (isinstance(self.wbits, int) and 1 <= self.wbits <= 63):
+            bad.append(f"Invalid GPTQ parameter 'wbits': {self.wbits!r} (expected int in 1..63).")
 
-        if not (
-            isinstance(self.groupsize, int)
-            and (self.groupsize == -1 or (1 <= self.groupsize <= self.blocksize))
-        ):
+        if not (isinstance(self.groupsize, int) and (self.groupsize == -1 or self.groupsize >= 1)):
             bad.append(
-                "Invalid GPTQ parameter 'groupsize': "
-                f"{self.groupsize!r} (expected int -1 or 1..blocksize)"
+                f"Invalid GPTQ parameter 'groupsize': {self.groupsize!r} "
+                f"(expected int: -1 for no grouping, or >= 1)."
             )
 
-        if not (isinstance(self.q_grid, int) and 1 <= self.q_grid <= 1000):
-            bad.append(
-                f"Invalid GPTQ parameter 'q_grid': {self.q_grid!r} (expected int in 1..1000)"
-            )
+        if self.mse:
+            if not (isinstance(self.q_grid, int) and self.q_grid >= 1):
+                bad.append(
+                    f"Invalid GPTQ parameter 'q_grid': {self.q_grid!r} "
+                    f"(expected int >= 1 when mse=True)."
+                )
 
-        if not (isinstance(self.q_norm, (int, float)) and self.q_norm >= 1e-5):
-            bad.append(
-                f"Invalid GPTQ parameter 'q_norm': {self.q_norm!r} (expected numeric >= 1e-5)"
-            )
+            if not (isinstance(self.q_norm, (int, float)) and self.q_norm > 0):
+                bad.append(
+                    f"Invalid GPTQ parameter 'q_norm': {self.q_norm!r} "
+                    f"(expected numeric > 0 when mse=True)."
+                )
 
         if self.mlp_wbits is not None:
             if not (isinstance(self.mlp_wbits, int) and 1 <= self.mlp_wbits <= 64):

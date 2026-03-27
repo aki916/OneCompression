@@ -26,28 +26,85 @@ class TestGPTQ(BaseQuantizeSpec):
     result_cls = GPTQResult
     default_parameter_for_test = {}
     boundary_parameters = [
+        # blocksize: int >= 1 (validated by validate_params), no explicit upper
+        {"blocksize": 1},  # blocksize lower boundary
+        {"blocksize": 1024},  # blocksize large value (no explicit upper bound)
+        # percdamp: float >= 3.95e-4 (validated by validate_params), no explicit upper
+        {"percdamp": 3.95e-4},  # percdamp lower boundary
+        {"percdamp": 1.0},  # percdamp large value (no explicit upper bound)
+        # wbits: int in 1..63 (validated by validate_params)
+        {"wbits": 1},  # wbits lower boundary
+        {"wbits": 63},  # wbits upper boundary (2**63-1 = INT64_MAX)
+        # groupsize: -1 or >=1 (validated by validate_params), no explicit upper
+        {"groupsize": -1},  # groupsize (no grouping)
+        {"groupsize": 1},  # groupsize positive lower boundary
+        {"groupsize": 1024},  # groupsize large value (no explicit upper bound)
+        # actorder: bool
         {"actorder": True},
+        {"actorder": False},
+        # mse: bool
         {"mse": True},
+        {"mse": False},
+        # sym: bool
+        {"sym": True},
         {"sym": False},
-        {"actorder": True, "mse": True, "sym": False},
+        # q_grid: int >= 1 (validated by validate_params when mse=True), no explicit upper
+        {"q_grid": 1, "mse": True},  # q_grid lower boundary
+        {"q_grid": 10000, "mse": True},  # q_grid large value (no explicit upper bound)
+        # q_norm: float > 0 (validated by validate_params when mse=True), no explicit upper
+        {"q_norm": 1e-5, "mse": True},  # q_norm near-zero positive
+        {"q_norm": 100.0, "mse": True},  # q_norm large value (no explicit upper bound)
+        # q_grid/q_norm: not validated when mse=False
+        {"q_grid": 0, "mse": False},  # allowed when mse=False
+        {"q_norm": 0.0, "mse": False},  # allowed when mse=False
+        # combo: all bools True
+        {"actorder": True, "mse": True, "sym": True},
+        # all class defaults
+        {
+            "blocksize": 128,
+            "percdamp": 0.01,
+            "wbits": 4,
+            "groupsize": -1,
+            "actorder": False,
+            "mse": False,
+            "sym": False,
+            "q_grid": 600,
+            "q_norm": 2.4,
+        },
+        # all minimum
         {
             "blocksize": 1,
             "percdamp": 3.95e-4,
             "wbits": 1,
             "groupsize": -1,
+            "actorder": False,
+            "mse": False,
+            "sym": False,
             "q_grid": 1,
             "q_norm": 1e-5,
+        },
+        # all maximum
+        {
+            "blocksize": 1024,
+            "percdamp": 1.0,
+            "wbits": 63,
+            "groupsize": 1024,
+            "actorder": True,
             "mse": True,
-            "sym": False,
+            "sym": True,
+            "q_grid": 10000,
+            "q_norm": 100.0,
         },
     ]
     abnormal_parameters = [
-        {"blocksize": -1},
-        {"percdamp": -0.1},
-        {"wbits": 0},
-        {"groupsize": 0},
-        {"q_grid": -1, "mse": True},
-        {"q_norm": 0.0, "mse": True},
+        {"blocksize": 0},  # below lower boundary (blocksize >= 1)
+        {"percdamp": 0.0},  # below lower boundary (percdamp >= 3.95e-4)
+        {"wbits": 0, "sym": True},  # below lower boundary (wbits >= 1)
+        {"wbits": 64},  # above upper boundary (wbits <= 63, INT64 overflow)
+        {"groupsize": 0},  # between -1 and 1 (invalid)
+        {"groupsize": -2},  # just below -1
+        {"q_grid": 0, "mse": True},  # below lower boundary (q_grid >= 1)
+        {"q_norm": 0.0, "mse": True},  # boundary value (q_norm > 0, strict)
     ]
     logger = logging.getLogger(__name__)
 

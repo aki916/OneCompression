@@ -169,33 +169,50 @@ class DBF(Quantizer):
         super().__post_init__()
 
     def validate_params(self):
-        """Validate DBF parameters once in setup()."""
+        """Validate DBF parameters once in setup().
+
+        Validated ranges:
+            target_bits: float > 0
+            iters: int >= 1
+            reg: float >= 0
+            balance_iters: int >= 1 (when use_balancing=True)
+            balance_alpha: float > 0 (when use_balancing=True)
+            balance_mode: str in {"l1", "l2"} (when use_balancing=True)
+        """
         bad = []
 
-        if (
-            self.target_bits is None
-            or not isinstance(self.target_bits, (int, float))
-            or not (self.target_bits >= 1.0)
-        ):
+        if not (isinstance(self.target_bits, (int, float)) and self.target_bits > 0):
             bad.append(
-                f"Invalid DBF parameter 'target_bits': {self.target_bits!r} (expected numeric >= 1.0)"
+                f"Invalid DBF parameter 'target_bits': {self.target_bits!r} (expected numeric > 0)."
             )
 
         if not (isinstance(self.iters, int) and self.iters >= 1):
-            bad.append(f"Invalid DBF parameter 'iters': {self.iters!r} (expected int >= 1)")
+            bad.append(f"Invalid DBF parameter 'iters': {self.iters!r} (expected int >= 1).")
 
         if not (isinstance(self.reg, (int, float)) and self.reg >= 0):
-            bad.append(f"Invalid DBF parameter 'reg': {self.reg!r} (expected numeric >= 0.0)")
+            bad.append(f"Invalid DBF parameter 'reg': {self.reg!r} (expected numeric >= 0).")
 
-        if not (isinstance(self.balance_iters, int) and self.balance_iters >= 1):
-            bad.append(
-                f"Invalid DBF parameter 'balance_iters': {self.balance_iters!r} (expected int >= 1)"
-            )
+        if self.use_balancing:
+            if not (isinstance(self.balance_iters, int) and self.balance_iters >= 1):
+                bad.append(
+                    f"Invalid DBF parameter 'balance_iters': {self.balance_iters!r} "
+                    f"(expected int >= 1 when use_balancing=True)."
+                )
 
-        if not (isinstance(self.balance_alpha, (int, float)) and self.balance_alpha >= 1):
-            bad.append(
-                f"Invalid DBF parameter 'balance_alpha': {self.balance_alpha!r} (expected numeric >= 1.0)"
-            )
+            if not (isinstance(self.balance_alpha, (int, float)) and self.balance_alpha > 0):
+                bad.append(
+                    f"Invalid DBF parameter 'balance_alpha': {self.balance_alpha!r} "
+                    f"(expected numeric > 0 when use_balancing=True)."
+                )
+
+            allowed_balance_modes = {"l1", "l2"}
+            if not (
+                isinstance(self.balance_mode, str) and self.balance_mode in allowed_balance_modes
+            ):
+                bad.append(
+                    f"Invalid DBF parameter 'balance_mode': {self.balance_mode!r} "
+                    f"(expected one of {sorted(allowed_balance_modes)} when use_balancing=True)."
+                )
 
         if self.mlp_target_bits is not None:
             if not (
