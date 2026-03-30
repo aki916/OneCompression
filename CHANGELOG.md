@@ -35,6 +35,13 @@
 
 ### Documentation
 
+- Added `docs/user-guide/post-process.md`: LoRA SFT user guide covering accuracy recovery, knowledge injection, save/load, key parameters, teacher distillation, intermediate block alignment, and vLLM limitations
+- Added `docs/api/post_process.md`: API reference for `PostQuantizationProcess`, `PostProcessLoraSFT`, and convenience variants
+- Updated `docs/user-guide/examples.md` with LoRA SFT code examples (accuracy recovery, knowledge injection, save/load)
+- Updated `docs/api/runner.md` to include `create_quantized_model` and `save_quantized_model_pt`
+- Updated `docs/api/quantized_model_loader.md` to include `load_quantized_model_pt`
+- Updated `mkdocs.yml` navigation with new post-process pages
+
 ### Tests
 
 - Added smoke test for `PostProcessLoraSFT` (`tests/onecomp/post_process/test_post_process_lora_sft.py`)
