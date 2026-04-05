@@ -19,8 +19,9 @@ import torch
 from torch import nn
 from transformers import Conv1D
 
-from onecomp.quantizer._quantizer import Quantizer, QuantizationResult
+from onecomp.quantizer._quantizer import Quantizer, QuantizationResult, _safe_cholesky, _safe_cholesky_inverse
 from onecomp.utils.quant_config import get_quant_param
+from onecomp.utils.device import empty_cache
 
 
 @dataclass
@@ -489,9 +490,9 @@ def _compute_inverse_hessian(
     damp_scale = 1.0
     for attempt in range(max_retries):
         try:
-            cholesky_lower = torch.linalg.cholesky(hessian)
+            cholesky_lower = _safe_cholesky(hessian)
             break
-        except torch._C._LinAlgError:
+        except (torch._C._LinAlgError, RuntimeError):
             damp_scale *= 10.0
             extra = damp_scale * damp
             hessian[diag, diag] += extra
@@ -506,8 +507,8 @@ def _compute_inverse_hessian(
             "Cholesky decomposition failed after %d damping attempts. "
             "The Hessian may be severely ill-conditioned." % max_retries
         )
-    hessian = torch.cholesky_inverse(cholesky_lower)
-    return torch.linalg.cholesky(hessian, upper=True)
+    hessian = _safe_cholesky_inverse(cholesky_lower)
+    return _safe_cholesky(hessian, upper=True)
 
 
 def run_gptq(  # pylint: disable=too-many-positional-arguments
@@ -643,9 +644,10 @@ def run_gptq(  # pylint: disable=too-many-positional-arguments
         zero = quantizer.zero.to(dtype=torch.int32, device="cpu")
     perm = perm.cpu() if perm is not None else None
 
+    _device = quantized_weight.device
     del hessian, Hinv, matrix_W, Q_int
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(_device)
 
     return {
         "qweight": quantized_weight,

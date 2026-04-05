@@ -37,3 +37,7 @@ from .blockwise import (
 )
 
 from .dtype import needs_bfloat16
+from .device import (
+    get_default_device,
+    empty_cache,
+)

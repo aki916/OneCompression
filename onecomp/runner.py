@@ -29,6 +29,7 @@ from .quantizer.autobit import AutoBitQuantizer
 from .utils import calculate_accuracy as calc_accuracy
 from .utils import calculate_perplexity as calc_perplexity
 from .log import setup_logger
+from .utils import get_default_device, empty_cache
 
 
 class Runner:
@@ -403,7 +404,7 @@ class Runner:
         wbits: Optional[float] = None,
         total_vram_gb: Optional[float] = None,
         groupsize: int = 128,
-        device: str = "cuda:0",
+        device: str = None,
         qep: bool = True,
         evaluate: bool = True,
         eval_original_model: bool = False,
@@ -429,7 +430,8 @@ class Runner:
                 automatically.
             groupsize (int): GPTQ group size (default: 128).
                 Use -1 to disable grouping.
-            device (str): Device to place the model on (default: "cuda:0").
+            device (str or None): Device to place the model on.
+                When ``None`` (default), auto-detected (CUDA > MPS > CPU).
             qep (bool): Whether to use QEP (default: True).
             evaluate (bool): Whether to calculate perplexity and
                 accuracy after quantization (default: True).
@@ -477,6 +479,10 @@ class Runner:
         """
         setup_logger()
         logger = getLogger(__name__)
+
+        if device is None:
+            device = str(get_default_device())
+            logger.info("Auto-detected device: %s", device)
 
         candidate_bits = (2, 3, 4, 8)
 
@@ -537,7 +543,8 @@ class Runner:
                 save_path=save_dir if save_dir is not None else None,
                 enable_fused_groups=True,
             )
-        runner = cls(model_config=model_config, quantizer=quantizer, qep=qep)
+        qep_config = QEPConfig(device=device)
+        runner = cls(model_config=model_config, quantizer=quantizer, qep=qep, qep_config=qep_config)
         runner.run()
 
         if evaluate:
@@ -1068,7 +1075,7 @@ class Runner:
             tokenizer = self.model_config.load_tokenizer()
             original_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
             del model, tokenizer
-            torch.cuda.empty_cache()
+            empty_cache()
 
         if quantized_model:
             try:
@@ -1085,7 +1092,7 @@ class Runner:
                     model.to(self.model_config.device)
                     quantized_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
                     del model, tokenizer
-                torch.cuda.empty_cache()
+                empty_cache()
             except NotImplementedError:
                 logger.warning(
                     "This quantization method does not support creating a quantized model; "
@@ -1100,7 +1107,7 @@ class Runner:
             self.update_model_weights(model, quantizer=quantizer)
             dequantized_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
             del model, tokenizer
-            torch.cuda.empty_cache()
+            empty_cache()
 
         return original_result, dequantized_result, quantized_result
 
@@ -1964,7 +1971,7 @@ class Runner:
             )
             # Release fragmented GPU memory from previous operations (e.g., run())
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache()
 
             model = self.model_config.load_model()
             input_device = next(model.parameters()).device
@@ -1988,7 +1995,7 @@ class Runner:
                 )
                 # Release fragmented GPU memory from previous operations (e.g., run())
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
 
                 model = self.model_config.load_model()
                 input_device = next(model.parameters()).device
