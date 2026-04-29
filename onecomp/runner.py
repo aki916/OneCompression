@@ -12,12 +12,14 @@ import math
 import gc
 import json
 import os
+import sys
 from typing import Optional
 import time
 from logging import getLogger
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 from .__version__ import __version__
 from .calibration import CalibrationConfig, prepare_calibration_dataset
@@ -351,32 +353,35 @@ class Runner:
         logger = self.logger
         logger.info("OneComp version: %s", __version__)
         logger.info("Model: %s", self.model_config.get_model_id_or_path())
-        logger.info("Start the run method of Runner class")
 
-        logger.info("Checking the settings...")
+        has_post = bool(self.post_processes)
+        total_steps = 2 + int(has_post)  # check + quantize + (post)
+        step = 0
+
+        step += 1
+        logger.info("[%d/%d] Checking settings...", step, total_steps)
         self.check()
         self._exclude_moe_router_if_needed()
 
+        step += 1
         if self.lpcd_config is not None:
-            logger.info("Start quantization with LPCD")
+            logger.info("[%d/%d] Quantizing with LPCD", step, total_steps)
             self.quantize_with_lpcd()
         elif self.qep:
-            logger.info("Start quantization with error propagation (QEP)")
+            logger.info("[%d/%d] Quantizing with error propagation (QEP)", step, total_steps)
             self.quantize_with_qep()
         else:
-            logger.info("Start quantization")
+            logger.info("[%d/%d] Quantizing", step, total_steps)
             self.quantize()
 
-        if self.post_processes:
+        if has_post:
+            step += 1
+            logger.info("[%d/%d] Post-processing", step, total_steps)
             self.run_post_processes()
 
         elapsed_time = time.time() - start_time
-        logger.info(
-            "Finished the run method of Runner class (elapsed time: %.2f seconds)",
-            elapsed_time,
-        )
+        logger.info("Finished in %.2f seconds", elapsed_time)
 
-        # Calculate total and average from per-layer quantization times and log them
         target_quantizers = self.quantizers if self.quantizers is not None else [self.quantizer]
         for q in target_quantizers:
             quant_times = [
@@ -690,7 +695,13 @@ class Runner:
             "Quantizing the model without calibration using %s",
             self.quantizer.name,
         )
-        for module in self.quantizer.module_to_name.keys():
+        _disable_tqdm = not (hasattr(sys.stderr, "isatty") and sys.stderr.isatty())
+        for module in tqdm(
+            self.quantizer.module_to_name.keys(),
+            desc="Quantizing",
+            unit="layer",
+            disable=_disable_tqdm,
+        ):
             self.quantizer.quantize(module, None, None)
 
         self.quantizer.execute_post_processing()
@@ -878,16 +889,16 @@ class Runner:
         )
 
     def print_quantization_results(self, quantizer=None):
-        """Log quantization results.
+        """Log quantization results as a formatted table.
 
         Formats and logs the quantizer results.
         The following information is output for each layer:
 
         - Quantization time (seconds)
-        - Output squared error (only if value exists)
         - Mean output squared error (only if value exists)
-        - Weight squared error (only if value exists)
         - Mean weight squared error (only if value exists)
+        - Relative output squared error (only if value exists)
+        - Relative weight squared error (only if value exists)
 
         Args:
             quantizer (Quantizer, optional):
@@ -914,40 +925,69 @@ class Runner:
             )
             return
 
-        logger.info("Quantization results for %s:", quantizer.name)
+        results = quantizer.results
+        if not results:
+            logger.warning("No quantization results to display.")
+            return
 
-        for name, result in quantizer.results.items():
-            logger.info("%s:", name)
-            logger.info(
-                "    Quantization time: %s seconds",
-                f"{result.quantization_time:.2f}",
-            )
-            logger.info(
-                "    Output squared error: %s",
-                f"{result.output_squared_error:.2e}",
-            )
-            logger.info(
-                "    Mean output squared error: %s",
-                f"{result.mean_output_squared_error:.2e}",
-            )
-            logger.info(
-                "    Weight squared error: %s",
-                f"{result.weight_squared_error:.2e}",
-            )
-            logger.info(
-                "    Mean weight squared error: %s",
-                f"{result.mean_weight_squared_error:.2e}",
-            )
-            if result.relative_output_squared_error is not None:
-                logger.info(
-                    "    Relative output squared error: %s",
-                    f"{result.relative_output_squared_error:.2e}",
+        has_rel_out = any(r.relative_output_squared_error is not None for r in results.values())
+        has_rel_wgt = any(r.relative_weight_squared_error is not None for r in results.values())
+
+        col_layer = 42
+        col_time = 8
+        col_metric = 12
+
+        header_parts = [
+            f"{'Layer':<{col_layer}s}",
+            f"{'Time':>{col_time}s}",
+            f"{'Out MSE':>{col_metric}s}",
+            f"{'Wgt MSE':>{col_metric}s}",
+        ]
+        if has_rel_out:
+            header_parts.append(f"{'Rel Out':>{col_metric}s}")
+        if has_rel_wgt:
+            header_parts.append(f"{'Rel Wgt':>{col_metric}s}")
+        header = " ".join(header_parts)
+        sep = "-" * len(header)
+
+        lines = [f"Quantization Results ({quantizer.name})", header, sep]
+
+        total_time = 0.0
+        for name, r in results.items():
+            short_name = name if len(name) <= col_layer else "..." + name[-(col_layer - 3) :]
+            t = r.quantization_time if r.quantization_time is not None else 0.0
+            total_time += t
+
+            row_parts = [
+                f"{short_name:<{col_layer}s}",
+                f"{t:>{col_time - 1}.2f}s",
+                f"{r.mean_output_squared_error:>{col_metric}.2e}"
+                if r.mean_output_squared_error is not None
+                else f"{'N/A':>{col_metric}s}",
+                f"{r.mean_weight_squared_error:>{col_metric}.2e}"
+                if r.mean_weight_squared_error is not None
+                else f"{'N/A':>{col_metric}s}",
+            ]
+            if has_rel_out:
+                row_parts.append(
+                    f"{r.relative_output_squared_error:>{col_metric}.2e}"
+                    if r.relative_output_squared_error is not None
+                    else f"{'N/A':>{col_metric}s}"
                 )
-            if result.relative_weight_squared_error is not None:
-                logger.info(
-                    "    Relative weight squared error: %s",
-                    f"{result.relative_weight_squared_error:.2e}",
+            if has_rel_wgt:
+                row_parts.append(
+                    f"{r.relative_weight_squared_error:>{col_metric}.2e}"
+                    if r.relative_weight_squared_error is not None
+                    else f"{'N/A':>{col_metric}s}"
                 )
+            lines.append(" ".join(row_parts))
+
+        lines.append(sep)
+        n_layers = len(results)
+        avg_time = total_time / n_layers if n_layers else 0.0
+        lines.append(f"Total: {n_layers} layers, {total_time:.2f}s (avg {avg_time:.2f}s/layer)")
+
+        logger.info("\n".join(lines))
 
     def save_quantization_statistics(self, path: str, quantizer=None):
         """Save the quantization statistics

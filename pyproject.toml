@@ -33,6 +33,7 @@ dependencies = [
     "hqq>=0.2.8",
     "safetensors",
     "ortools>=9.15.6755",
+    "tqdm>=4.60",
 ]
 
 [project.urls]
