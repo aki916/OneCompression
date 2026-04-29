@@ -15,8 +15,10 @@ from logging import getLogger
 
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from onecomp.calibration import CalibrationConfig, prepare_calibration_dataset
+from onecomp.log import should_disable_tqdm
 from onecomp.lpcd import LPCDConfig
 from onecomp.model_config import ModelConfig
 from onecomp.qep import QEPConfig
@@ -88,10 +90,12 @@ def run_quantize_with_lpcd(
     logger.info("Quantizing the model using %s", quantizer.name)
 
     # 2. For each target transformer block, perform the following sequentially
-    for block_idx, block in enumerate(blocks):
+    for block_idx, block in enumerate(
+        tqdm(blocks, desc="Quantizing blocks", unit="block", disable=should_disable_tqdm())
+    ):
 
-        logger.info(
-            "Processing : %2d-th Transformer Block -------------------------------------------------",
+        logger.debug(
+            "Processing : %2d-th Transformer Block",
             block_idx + 1,
         )
 
@@ -122,7 +126,7 @@ def run_quantize_with_lpcd(
         # 3. For each group of layers, perform the following sequentially
         for group_q, group_f in zip(groups_q, groups_f):
 
-            logger.info(
+            logger.debug(
                 "Processing group of layers: %s",
                 ", ".join([quantizer.module_to_name.get(m, "N/A") for m in group_q]),
             )
@@ -149,7 +153,7 @@ def run_quantize_with_lpcd(
                 # Skip layers not registered for quantization
                 if module not in quantizer.module_to_name:
                     skipped_name = module_q_to_name.get(module, "<unknown>")
-                    logger.info(
+                    logger.debug(
                         "Skipping layer (not in quantization targets): %s", skipped_name
                     )
                     continue
@@ -159,10 +163,7 @@ def run_quantize_with_lpcd(
                 # Fall back to standard quantization if the module is not LPCD targets
                 if not module in lpcd_modules_q:
 
-                    logger.info(
-                        "Processing layer: %s =================================================",
-                        name,
-                    )
+                    logger.debug("Processing layer: %s", name)
 
                     if qep_config is None:
                         # Quatize without QEP
@@ -201,9 +202,9 @@ def run_quantize_with_lpcd(
                 # 3-3. Perform LPCD optimisation
                 for module_group in lpcd_metrics.get_refineable_metrics():
 
-                    logger.info("perform LPCD optimization")
+                    logger.debug("perform LPCD optimization")
                     lpcd_names = [name for name, _ in module_group[0].named_targets()]
-                    logger.info("LPCD targets: %s", lpcd_names)
+                    logger.debug("LPCD targets: %s", lpcd_names)
                     refiner(
                         lpcd_config,
                         module_group,
@@ -227,7 +228,7 @@ def run_quantize_with_lpcd(
             device,
             kwargs
         )
-        logger.info(f"[INFO] Layer {block_idx + 1} MSE: {mse:.6e}")
+        logger.debug("Block %d MSE: %s", block_idx + 1, f"{mse:.6e}")
 
         # free memory
         block_q.cpu()

@@ -12,7 +12,6 @@ import math
 import gc
 import json
 import os
-import sys
 from typing import Optional
 import time
 from logging import getLogger
@@ -30,7 +29,7 @@ from .quantizer import GPTQ, Quantizer
 from .quantizer.autobit import AutoBitQuantizer
 from .utils import calculate_accuracy as calc_accuracy
 from .utils import calculate_perplexity as calc_perplexity
-from .log import setup_logger
+from .log import setup_logger, should_disable_tqdm
 
 
 class Runner:
@@ -251,48 +250,79 @@ class Runner:
         """
 
         if not isinstance(self.model_config, ModelConfig):
-            raise TypeError("`model_config` is not a `ModelConfig` object")
+            raise TypeError(
+                f"'model_config' must be a ModelConfig instance, got {type(self.model_config).__name__}.\n"
+                "  help: Create one with ModelConfig(model_id='your-model-id')"
+            )
 
         # Type check for quantizer / quantizers
         if self.quantizer is not None and self.quantizers is not None:
             raise ValueError(
-                "Cannot specify both 'quantizer' and 'quantizers'. Use one or the other."
+                "Cannot specify both 'quantizer' and 'quantizers'.\n"
+                "  help: Use 'quantizer' for a single quantizer, or 'quantizers' for benchmark comparison."
             )
 
         if self.quantizers is not None:
             for i, q in enumerate(self.quantizers):
                 if not isinstance(q, Quantizer):
-                    raise TypeError(f"`quantizers[{i}]` is not a `Quantizer` object")
+                    raise TypeError(
+                        f"quantizers[{i}] must be a Quantizer instance, got {type(q).__name__}.\n"
+                        "  help: Use a quantizer like GPTQ(wbits=4) or JointQ(bits=4)."
+                    )
         elif self.quantizer is not None:
             if not isinstance(self.quantizer, Quantizer):
-                raise TypeError("`quantizer` is not a `Quantizer` object")
+                raise TypeError(
+                    f"'quantizer' must be a Quantizer instance, got {type(self.quantizer).__name__}.\n"
+                    "  help: Use a quantizer like GPTQ(wbits=4) or JointQ(bits=4)."
+                )
         else:
-            raise ValueError("Either 'quantizer' or 'quantizers' must be specified.")
+            raise ValueError(
+                "Either 'quantizer' or 'quantizers' must be specified.\n"
+                "  help: Runner(model_config=..., quantizer=GPTQ(wbits=4))"
+            )
 
         # Parameter combination check
         batch_size = self.calibration_config.batch_size
         if self.quantizers is not None:
             # quantizers mode: qep=False, multi_gpu=False, batch_size required
             if self.qep:
-                raise ValueError("'quantizers' cannot be used with qep=True.")
+                raise ValueError(
+                    "'quantizers' (multiple) cannot be used with qep=True.\n"
+                    "  help: Use a single 'quantizer' with qep=True instead."
+                )
             if self.multi_gpu:
-                raise ValueError("'quantizers' cannot be used with multi_gpu=True.")
+                raise ValueError(
+                    "'quantizers' (multiple) cannot be used with multi_gpu=True.\n"
+                    "  help: Use a single 'quantizer' with multi_gpu=True instead."
+                )
             if batch_size is None:
                 raise ValueError(
-                    "'quantizers' requires 'calibration_config.batch_size' to be set."
+                    "'quantizers' (multiple) requires calibration_config.batch_size to be set.\n"
+                    "  help: CalibrationConfig(..., batch_size=128)"
                 )
         else:
             # Single quantizer mode: combination check
             if self.qep and self.multi_gpu:
-                raise ValueError("'qep' and 'multi_gpu' cannot be used together.")
+                raise ValueError(
+                    "'qep' and 'multi_gpu' cannot be used together.\n"
+                    "  help: Choose one: qep=True (single GPU) or multi_gpu=True."
+                )
             if self.qep and batch_size is not None:
-                raise ValueError("'qep' cannot be used with 'calibration_config.batch_size'.")
+                raise ValueError(
+                    "'qep' cannot be used with calibration_config.batch_size.\n"
+                    "  help: Remove batch_size from CalibrationConfig when using qep=True."
+                )
             if self.multi_gpu and batch_size is not None:
                 raise ValueError(
-                    "'multi_gpu' cannot be used with 'calibration_config.batch_size'."
+                    "'multi_gpu' cannot be used with calibration_config.batch_size.\n"
+                    "  help: Remove batch_size from CalibrationConfig when using multi_gpu=True."
                 )
             if self.multi_gpu and not self.quantizer.flag_calibration:
-                raise ValueError("'multi_gpu' requires a quantizer with flag_calibration=True.")
+                raise ValueError(
+                    f"'multi_gpu' requires a calibration-based quantizer, "
+                    f"but {self.quantizer.name} does not support calibration.\n"
+                    "  help: Use a calibration-based quantizer like GPTQ."
+                )
 
         # Cross-validate calibration_dataset when AutoBitQuantizer is used
         quantizer = self.quantizer or (self.quantizers[0] if self.quantizers else None)
@@ -345,14 +375,57 @@ class Runner:
             keyword,
         )
 
+    def _log_config_summary(self):
+        """Log a configuration summary at the start of a run."""
+        logger = self.logger
+        target_quantizers = (
+            self.quantizers if self.quantizers is not None else [self.quantizer]
+        )
+        quantizer_desc = ", ".join(q.name for q in target_quantizers)
+
+        features = []
+        if self.qep:
+            features.append("QEP")
+        if self.lpcd_config is not None:
+            features.append("LPCD")
+        if self.multi_gpu:
+            gpu_desc = (
+                f"GPUs {self.gpu_ids}" if self.gpu_ids else "all GPUs"
+            )
+            features.append(f"multi-GPU ({gpu_desc})")
+        if self.post_processes:
+            features.append(
+                f"post-processes ({len(self.post_processes)})"
+            )
+
+        calib = self.calibration_config
+        calib_parts = [
+            f"dataset={calib.calibration_dataset}",
+            f"samples={calib.num_calibration_samples}",
+            f"max_length={calib.max_length}",
+        ]
+        if calib.batch_size is not None:
+            calib_parts.append(f"batch_size={calib.batch_size}")
+
+        lines = [
+            "Configuration:",
+            f"  Model:        {self.model_config.get_model_id_or_path()}",
+            f"  Quantizer:    {quantizer_desc}",
+            f"  Features:     {', '.join(features) if features else 'none'}",
+            f"  Calibration:  {', '.join(calib_parts)}",
+            f"  Device:       {self.model_config.device}",
+        ]
+        logger.info("\n".join(lines))
+
     def run(self):
         """Execute quantization (and related) processing"""
 
         start_time = time.time()
+        phase_times = {}
 
         logger = self.logger
         logger.info("OneComp version: %s", __version__)
-        logger.info("Model: %s", self.model_config.get_model_id_or_path())
+        self._log_config_summary()
 
         has_post = bool(self.post_processes)
         total_steps = 2 + int(has_post)  # check + quantize + (post)
@@ -360,10 +433,13 @@ class Runner:
 
         step += 1
         logger.info("[%d/%d] Checking settings...", step, total_steps)
+        t0 = time.time()
         self.check()
         self._exclude_moe_router_if_needed()
+        phase_times["Check"] = time.time() - t0
 
         step += 1
+        t0 = time.time()
         if self.lpcd_config is not None:
             logger.info("[%d/%d] Quantizing with LPCD", step, total_steps)
             self.quantize_with_lpcd()
@@ -373,33 +449,27 @@ class Runner:
         else:
             logger.info("[%d/%d] Quantizing", step, total_steps)
             self.quantize()
+        phase_times["Quantization"] = time.time() - t0
 
         if has_post:
             step += 1
             logger.info("[%d/%d] Post-processing", step, total_steps)
+            t0 = time.time()
             self.run_post_processes()
+            phase_times["Post-processing"] = time.time() - t0
 
         elapsed_time = time.time() - start_time
-        logger.info("Finished in %.2f seconds", elapsed_time)
 
         target_quantizers = self.quantizers if self.quantizers is not None else [self.quantizer]
         for q in target_quantizers:
-            quant_times = [
-                result.quantization_time
-                for result in q.results.values()
-                if result.quantization_time is not None
-            ]
-            if quant_times:
-                total_quant_time = sum(quant_times)
-                avg_quant_time = total_quant_time / len(quant_times)
-                logger.info(
-                    "[%s] Quantization time: total=%.2f seconds, "
-                    "average=%.2f seconds/layer (%d layers)",
-                    q.name,
-                    total_quant_time,
-                    avg_quant_time,
-                    len(quant_times),
-                )
+            if q.results:
+                self.print_quantization_results(quantizer=q)
+
+        timing_lines = ["Timing:"]
+        for phase_name, phase_sec in phase_times.items():
+            timing_lines.append(f"  {phase_name + ':':<20s} {phase_sec:>8.1f}s")
+        timing_lines.append(f"  {'Total:':<20s} {elapsed_time:>8.1f}s")
+        logger.info("\n".join(timing_lines))
 
     @classmethod
     def auto_run(
@@ -562,6 +632,16 @@ class Runner:
 
         if save_dir is not None:
             runner.save_quantized_model(save_dir)
+            logger.info(
+                "Next steps:\n"
+                "  Load in Python:\n"
+                "    from onecomp import load_quantized_model\n"
+                "    model, tokenizer = load_quantized_model(%r)\n"
+                "  Serve with vLLM:\n"
+                "    vllm serve %s",
+                save_dir,
+                save_dir,
+            )
 
         return runner
 
@@ -695,12 +775,11 @@ class Runner:
             "Quantizing the model without calibration using %s",
             self.quantizer.name,
         )
-        _disable_tqdm = not (hasattr(sys.stderr, "isatty") and sys.stderr.isatty())
         for module in tqdm(
             self.quantizer.module_to_name.keys(),
             desc="Quantizing",
             unit="layer",
-            disable=_disable_tqdm,
+            disable=should_disable_tqdm(),
         ):
             self.quantizer.quantize(module, None, None)
 
@@ -1864,7 +1943,7 @@ class Runner:
                     shutil.copy2(src, save_directory)
                     logger.info("Copied %s to save directory", fname)
 
-        logger.info(f"Quantized model saved to {save_directory}")
+        logger.info("Quantized model saved to %s", save_directory)
         return save_directory
 
     def save_quantized_model_pt(self, save_directory: str):

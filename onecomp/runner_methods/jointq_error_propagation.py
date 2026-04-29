@@ -150,8 +150,8 @@ def run_jointq_error_propagation(
     for module, name in module_to_name.items():
         # Excluded layers only have Step 1 weights applied (Step 2 skipped)
         if name in exclude_layer_names:
-            logger.info(
-                " ========= Applying step1 weight (excluded from step2): %s =========",
+            logger.debug(
+                "Applying step1 weight (excluded from step2): %s",
                 name,
             )
             result = current_results[name]
@@ -175,10 +175,7 @@ def run_jointq_error_propagation(
             )  # TODO: Migrate to compute_dequantized_weight()
             continue
 
-        logger.info(
-            " ========= Processing layer: %s =========",
-            name,
-        )
+        logger.debug("Processing layer: %s", name)
 
         # 2-1. Save input activations for the target layer only to CPU
         quant_input_activation = capture_input_activations(

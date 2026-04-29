@@ -7,6 +7,7 @@ Author: Keiji Kimura
 """
 
 import argparse
+import sys
 
 from .__version__ import __version__
 
@@ -63,6 +64,30 @@ def main():
         default="auto",
         help='save directory (default: auto-generated, "none" to skip)',
     )
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="enable verbose (DEBUG) output",
+    )
+    verbosity.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="suppress most output (WARNING and above only)",
+    )
+
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable tqdm progress bars",
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=["auto", "json"],
+        default="auto",
+        help="log output format (default: auto, json for structured NDJSON)",
+    )
     parser.add_argument(
         "--version",
         action="version",
@@ -73,17 +98,36 @@ def main():
 
     save_dir = None if args.save_dir.lower() == "none" else args.save_dir
 
+    # Resolve logging level from verbosity flags
+    if args.verbose:
+        log_level = "DEBUG"
+    elif args.quiet:
+        log_level = "WARNING"
+    else:
+        log_level = "INFO"
+
+    disable_tqdm = args.no_progress or args.quiet
+
     # Lazy import to keep --help fast
+    from .log import setup_logger  # pylint: disable=import-outside-toplevel
     from .runner import Runner  # pylint: disable=import-outside-toplevel
 
-    Runner.auto_run(
-        model_id=args.model_id,
-        wbits=args.wbits,
-        total_vram_gb=args.total_vram_gb,
-        groupsize=args.groupsize,
-        device=args.device,
-        qep=not args.no_qep,
-        evaluate=not args.no_eval,
-        eval_original_model=args.eval_original,
-        save_dir=save_dir,
-    )
+    setup_logger(level=log_level, disable_tqdm=disable_tqdm, log_format=args.log_format)
+
+    try:
+        Runner.auto_run(
+            model_id=args.model_id,
+            wbits=args.wbits,
+            total_vram_gb=args.total_vram_gb,
+            groupsize=args.groupsize,
+            device=args.device,
+            qep=not args.no_qep,
+            evaluate=not args.no_eval,
+            eval_original_model=args.eval_original,
+            save_dir=save_dir,
+        )
+    except (ValueError, TypeError) as exc:
+        if args.verbose:
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

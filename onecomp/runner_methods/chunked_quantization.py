@@ -23,7 +23,6 @@ Processing flow:
 
 """
 
-import sys
 import time
 from logging import getLogger
 from typing import List
@@ -32,6 +31,7 @@ import torch
 from tqdm import tqdm
 
 from onecomp.calibration import CalibrationConfig, prepare_calibration_dataset
+from onecomp.log import should_disable_tqdm
 from onecomp.model_config import ModelConfig
 from onecomp.quantizer._quantizer import Quantizer, QuantizationResult
 
@@ -217,9 +217,8 @@ def accumulate_xtx(
     # Forward per chunk -> accumulate X^T X within hooks
     num_chunks = (total_samples + calibration_batch_size - 1) // calibration_batch_size
 
-    _disable_tqdm = not (hasattr(sys.stderr, "isatty") and sys.stderr.isatty())
     for chunk_idx in tqdm(
-        range(num_chunks), desc="Accumulating", unit="chunk", disable=_disable_tqdm
+        range(num_chunks), desc="Accumulating", unit="chunk", disable=should_disable_tqdm()
     ):
         chunk_start = chunk_idx * calibration_batch_size
         chunk_end = min(chunk_start + calibration_batch_size, total_samples)
@@ -280,8 +279,7 @@ def quantize_group(quantizer, group, xtx_dict, nsamples):
             Number of samples (= total_samples * seq_len).
     """
 
-    _disable_tqdm = not (hasattr(sys.stderr, "isatty") and sys.stderr.isatty())
-    for module, name in tqdm(group, desc="Quantizing", unit="layer", disable=_disable_tqdm):
+    for module, name in tqdm(group, desc="Quantizing", unit="layer", disable=should_disable_tqdm()):
         if name not in xtx_dict and (quantizer.flag_hessian or quantizer.flag_xtx):
             logger.warning("Skipping %s: no activations captured (unused during forward)", name)
             continue

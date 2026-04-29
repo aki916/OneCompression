@@ -21,8 +21,10 @@ Current procedure:
 from logging import getLogger
 
 import torch
+from tqdm import tqdm
 
 from onecomp.calibration import CalibrationConfig, prepare_calibration_dataset
+from onecomp.log import should_disable_tqdm
 from onecomp.model_config import ModelConfig
 from onecomp.qep._qep_config import QEPConfig
 from onecomp.quantizer._quantizer import Quantizer
@@ -81,12 +83,12 @@ def run_quantize_with_qep(
     logger.info("Quantizing the model using %s", quantizer.name)
 
     # 2. For each target layer, perform the following sequentially
-    for module, name in quantizer.module_to_name.items():
+    for module, name in tqdm(
+        quantizer.module_to_name.items(), desc="Quantizing layers", unit="layer",
+        disable=should_disable_tqdm(),
+    ):
 
-        logger.info(
-            "Processing layer: %s =================================================",
-            name,
-        )
+        logger.debug("Processing layer: %s", name)
 
         # 2-1. Save input activations of only the target layer to CPU
         quant_input_activation = capture_input_activations(

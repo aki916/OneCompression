@@ -109,7 +109,7 @@ def run_capture_phase(
     def capture_hook(module, input, output):  # pylint: disable=redefined-builtin
         """Forward hook: Capture input activations and weights, save to CPU."""
         name = quantizer.module_to_name[module]
-        logger.info("Capturing layer: %s", name)
+        logger.debug("Capturing layer: %s", name)
 
         # Get input activation
         if isinstance(input, tuple):
@@ -269,7 +269,7 @@ def run_quantization_phase(
 
         with lock:
             results[layer_name] = quant_result
-            logger.info("  %s on GPU %d: %.2f sec", layer_name, gpu_id, layer_elapsed)
+            logger.debug("  %s on GPU %d: %.2f sec", layer_name, gpu_id, layer_elapsed)
 
         # Free memory
         del dummy_module
@@ -301,7 +301,7 @@ def run_quantization_phase(
         while True:
             try:
                 layer_name = task_queue.get_nowait()
-                logger.info("GPU %d got task: %s", gpu_id, layer_name)
+                logger.debug("GPU %d got task: %s", gpu_id, layer_name)
             except queue.Empty:
                 break  # Exit when queue is empty
             try:

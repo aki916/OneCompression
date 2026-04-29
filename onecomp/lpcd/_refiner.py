@@ -88,15 +88,12 @@ def refiner(
 
             # Skip layers not registered for quantization
             if module_q not in quantizer.module_to_name:
-                logger.info("Skipping layer (not in quantization targets): %s", name)
+                logger.debug("Skipping layer (not in quantization targets): %s", name)
                 continue
             else:
                 name = quantizer.module_to_name[module_q]
 
-            logger.info(
-                "Processing layer for refinement: %s =================================================",
-                name,
-            )
+            logger.debug("Processing layer for refinement: %s", name)
             
             default_mse = compute_mse(
                 metric_q, metric_f, inps_q, inps_f, batch_size, device, kwargs
@@ -106,7 +103,7 @@ def refiner(
             cf_solver = metric_q.closed_form_solvers()[module_idx]
 
             if lpcd_config.use_closed_form and cf_solver is not None:
-                logger.info("Relaxing with closed-form method.")
+                logger.debug("Relaxing with closed-form method.")
                 cf_solver_arg = ClosedFormSolverArgument(
                     lpcd_config=lpcd_config,
                     block_q=metric_q.block,
@@ -118,7 +115,7 @@ def refiner(
                 )
                 cf_solver(cf_solver_arg)
             else:
-                logger.info("Relaxing with gradient descent.")
+                logger.debug("Relaxing with gradient descent.")
                 
                 gradient_solver(
                     lpcd_config=lpcd_config,

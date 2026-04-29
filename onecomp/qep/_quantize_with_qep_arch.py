@@ -21,7 +21,9 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 from onecomp.calibration import CalibrationConfig, prepare_calibration_dataset
+from onecomp.log import should_disable_tqdm
 from onecomp.model_config import ModelConfig
 from onecomp.qep._qep_config import QEPConfig
 from onecomp.quantizer._quantizer import Quantizer
@@ -319,10 +321,12 @@ def run_quantize_with_qep_arch(
     }
 
     # 2. For each target transformer block, perform the following sequentially
-    for block_idx, block in enumerate(blocks):
+    for block_idx, block in enumerate(
+        tqdm(blocks, desc="Quantizing blocks", unit="block", disable=should_disable_tqdm())
+    ):
 
-        logger.info(
-            "Processing : %2d-th Transformer Block -------------------------------------------------",
+        logger.debug(
+            "Processing : %2d-th Transformer Block",
             block_idx + 1,
         )
 
@@ -376,7 +380,7 @@ def run_quantize_with_qep_arch(
         # 3. Process regular (non-expert) groups with full QEP
         for group_q, group_f in regular_pairs:
 
-            logger.info(
+            logger.debug(
                 "Processing group of layers: %s",
                 ", ".join([quantizer.module_to_name.get(m, "N/A") for m in group_q]),
             )
@@ -399,7 +403,7 @@ def run_quantize_with_qep_arch(
 
                 # Skip layers not registered for quantization
                 if module not in quantizer.module_to_name:
-                    logger.info("Skipping layer (not in quantization targets)")
+                    logger.debug("Skipping layer (not in quantization targets)")
                     continue
 
                 name = quantizer.module_to_name[module]
@@ -412,10 +416,10 @@ def run_quantize_with_qep_arch(
                 exclude = any(kw in name for kw in qep_config.exclude_layer_keywords)
                 layer_delta = None if exclude else delta_hatX.clone()
 
-                logger.info(
-                    "Processing layer: %s %s=================================================",
+                logger.debug(
+                    "Processing layer: %s%s",
                     name,
-                    "(no weight correction) " if exclude else "",
+                    " (no weight correction)" if exclude else "",
                 )
 
                 # Quantize the weights of the target layer
@@ -464,8 +468,8 @@ def run_quantize_with_qep_arch(
                     remaining_targets.discard(name)
                     continue
 
-                logger.info(
-                    "Processing layer: %s (no weight correction) =================================================",
+                logger.debug(
+                    "Processing layer: %s (no weight correction)",
                     name,
                 )
                 quantizer.quantize_with_qep(
@@ -494,9 +498,8 @@ def run_quantize_with_qep_arch(
         inps_q = forward_input(inps_q, block_q, kwargs, batch_size, device)
         inps_f = forward_input(inps_f, block_f, kwargs, batch_size, device)
 
-        # Compute MSE between quantized and full-precision block outputs
         mse = F.mse_loss(inps_q.float(), inps_f.float()).item()
-        logger.info(f"[INFO] Layer {block_idx + 1} MSE: {mse:.6e}")
+        logger.debug("Block %d MSE: %s", block_idx + 1, f"{mse:.6e}")
 
         # free memory
         block_q.cpu()
