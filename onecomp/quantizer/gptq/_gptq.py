@@ -475,6 +475,11 @@ def _compute_inverse_hessian(
     Cholesky decomposition fails (non-positive-definite), progressively
     increases damping and retries up to *max_retries* times.
 
+    Note:
+        This function uses torch.linalg.cholesky / torch.cholesky_inverse
+        directly (without MPS-safe wrappers) because the caller (run_gptq)
+        moves hessian to CPU before calling this function when on MPS.
+
     Args:
         hessian: Square Hessian matrix (modified in-place).
         percdamp: Base damping as a fraction of the mean diagonal.
@@ -490,7 +495,7 @@ def _compute_inverse_hessian(
     damp_scale = 1.0
     for attempt in range(max_retries):
         try:
-            cholesky_lower = _safe_cholesky(hessian)
+            cholesky_lower = torch.linalg.cholesky(hessian)
             break
         except (torch._C._LinAlgError, RuntimeError):
             damp_scale *= 10.0
@@ -507,8 +512,8 @@ def _compute_inverse_hessian(
             "Cholesky decomposition failed after %d damping attempts. "
             "The Hessian may be severely ill-conditioned." % max_retries
         )
-    hessian = _safe_cholesky_inverse(cholesky_lower)
-    return _safe_cholesky(hessian, upper=True)
+    hessian = torch.cholesky_inverse(cholesky_lower)
+    return torch.linalg.cholesky(hessian, upper=True)
 
 
 def run_gptq(  # pylint: disable=too-many-positional-arguments
