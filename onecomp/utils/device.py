@@ -8,6 +8,7 @@ Copyright 2025-2026 Fujitsu Ltd.
 import torch
 
 
+
 def get_default_device() -> torch.device:
     """Return the best available device: CUDA > MPS > CPU."""
     if torch.cuda.is_available():

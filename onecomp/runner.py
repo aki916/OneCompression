@@ -29,7 +29,7 @@ from .quantizer.autobit import AutoBitQuantizer
 from .utils import calculate_accuracy as calc_accuracy
 from .utils import calculate_perplexity as calc_perplexity
 from .log import setup_logger
-from .utils import get_default_device, empty_cache
+from .utils import empty_cache
 
 
 class Runner:
@@ -306,6 +306,36 @@ class Runner:
                     f"CalibrationConfig objects."
                 )
 
+        # MPS device validation: only GPTQ (or AutoBitQuantizer whose
+        # candidates are all GPTQ) is supported on MPS
+        device = self.model_config.device
+        is_mps = (device == "mps" or str(device).startswith("mps"))
+        if is_mps:
+            if self.multi_gpu:
+                raise ValueError(
+                    "multi_gpu is not supported on MPS device."
+                )
+            all_quantizers = (
+                self.quantizers if self.quantizers is not None
+                else [self.quantizer]
+            )
+            for i, q in enumerate(all_quantizers):
+                label = f"quantizers[{i}]" if self.quantizers else "quantizer"
+                if isinstance(q, AutoBitQuantizer):
+                    for j, cand in enumerate(q.quantizers):
+                        if not isinstance(cand, GPTQ):
+                            raise ValueError(
+                                f"{label}.quantizers[{j}] ({type(cand).__name__}) "
+                                f"is not supported on MPS device. "
+                                "AutoBitQuantizer on MPS requires all candidate "
+                                "quantizers to be GPTQ."
+                            )
+                elif not isinstance(q, GPTQ):
+                    raise ValueError(
+                        f"{label} ({type(q).__name__}) is not supported on MPS device. "
+                        "Only GPTQ quantization supports MPS."
+                    )
+
     def _exclude_moe_router_if_needed(self):
         """Exclude MoE router layers from quantization.
 
@@ -404,7 +434,7 @@ class Runner:
         wbits: Optional[float] = None,
         total_vram_gb: Optional[float] = None,
         groupsize: int = 128,
-        device: str = None,
+        device: str = "cuda:0",
         qep: bool = True,
         evaluate: bool = True,
         eval_original_model: bool = False,
@@ -430,8 +460,7 @@ class Runner:
                 automatically.
             groupsize (int): GPTQ group size (default: 128).
                 Use -1 to disable grouping.
-            device (str or None): Device to place the model on.
-                When ``None`` (default), auto-detected (CUDA > MPS > CPU).
+            device (str): Device to place the model on (default: "cuda:0").
             qep (bool): Whether to use QEP (default: True).
             evaluate (bool): Whether to calculate perplexity and
                 accuracy after quantization (default: True).
@@ -479,10 +508,6 @@ class Runner:
         """
         setup_logger()
         logger = getLogger(__name__)
-
-        if device is None:
-            device = str(get_default_device())
-            logger.info("Auto-detected device: %s", device)
 
         candidate_bits = (2, 3, 4, 8)
 

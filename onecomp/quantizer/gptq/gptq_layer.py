@@ -228,7 +228,7 @@ class GPTQLinear(nn.Module):
         zero: torch.Tensor,  # FP16
         perm: Optional[torch.Tensor] = None,  # INT64
         bias: Optional[torch.Tensor] = None,
-        device: Union[str, torch.device, None] = None,
+        device: Union[str, torch.device] = "cuda",
         pack_weights: bool = True,  # Pack INT weights for memory efficiency
         use_gemlite: Optional[bool] = None,  # GemLite flag
     ):
@@ -240,11 +240,7 @@ class GPTQLinear(nn.Module):
         self.groupsize = groupsize
         self.actorder = actorder
 
-        if device is None:
-            from onecomp.utils.device import get_default_device
-            device = get_default_device()
-        elif isinstance(device, str):
-            device = torch.device(device)
+        device = torch.device(device) if isinstance(device, str) else device
 
         # Decide whether to use GemLite
         if use_gemlite is None:
@@ -402,7 +398,7 @@ class GPTQLinear(nn.Module):
 
     @classmethod
     def from_quantization_result(  # pylint: disable=too-many-positional-arguments
-        cls, result, bias=None, device=None, pack_weights=True, use_gemlite=None
+        cls, result, bias=None, device="cuda", pack_weights=True, use_gemlite=None
     ):
         """
         Build GPTQLinear from GPTQResult (quantizer.results).
