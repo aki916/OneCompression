@@ -101,6 +101,9 @@ class ModelConfig:
         )
 
         config = self.load_config()
+        if self.is_modelopt_checkpoint():
+            return self._load_modelopt_model(kwargs["dtype"], effective_device)
+
         qcfg = getattr(config, "quantization_config", None)
         if isinstance(qcfg, dict) and qcfg.get("quant_method") == "mxfp4":
             from transformers import Mxfp4Config
@@ -137,6 +140,32 @@ class ModelConfig:
             model = _AutoVLM.from_pretrained(self.get_model_id_or_path(), **kwargs)
         model.eval()
         self.logger.info("Model loaded with dtype=%s", next(model.parameters()).dtype)
+        return model
+
+    def is_modelopt_checkpoint(self) -> bool:
+        """Return True for NVIDIA ModelOpt (FP8 / NVFP4) checkpoints."""
+        from .utils.modelopt_checkpoint import is_modelopt_checkpoint
+
+        return is_modelopt_checkpoint(self.load_config())
+
+    def _load_modelopt_model(self, dtype, device):
+        """Load a ModelOpt checkpoint, dequantizing it to bfloat16.
+
+        NVFP4 layers stay packed (see ``onecomp.utils.modelopt_checkpoint``),
+        so the model is always built on CPU and only moved when a concrete
+        device other than CPU is requested.
+        """
+        from .utils.modelopt_checkpoint import load_modelopt_model
+
+        if dtype != torch.bfloat16:
+            self.logger.warning(
+                "ModelOpt checkpoint detected; overriding dtype from %s to bfloat16.", dtype
+            )
+        model = load_modelopt_model(
+            self.get_model_id_or_path(), dtype=torch.bfloat16, log=self.logger
+        )
+        if device not in (None, "cpu", "auto") and not isinstance(device, dict):
+            model.to(device)
         return model
 
     def get_device(self) -> torch.device:

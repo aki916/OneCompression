@@ -14,11 +14,15 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-_MOE_EXPERT_KEY_RE = re.compile(r"\.mlp\.experts\.")
+_MOE_EXPERT_KEY_RE = re.compile(r"\.(?:mlp|mixer)\.experts\.")
 
 
 class _ExpertMLP(nn.Module):
-    """Single MoE expert with gate/up/down projections."""
+    """Single MoE expert with gate/up/down projections.
+
+    ``gate_proj`` is None for non-gated experts (e.g. NemotronH), which
+    compute ``down_proj(act_fn(up_proj(x)))``.
+    """
 
     __slots__ = ("act_fn",)
 
@@ -39,6 +43,7 @@ class _UnfusedExperts(nn.Module):
         experts: list,
         act_fn=None,
         combine_fn=None,
+        accumulate_in_router_dtype: bool = False,
     ):
         super().__init__()
         self._num_experts = num_experts
@@ -48,6 +53,8 @@ class _UnfusedExperts(nn.Module):
         # combine_fn: GPT-OSS — (gate, up) -> hidden; not expressible as act_fn(gate) * up.
         self.act_fn = act_fn
         self.combine_fn = combine_fn
+        # NemotronH sums the expert outputs in the router-weight dtype (fp32).
+        self.accumulate_in_router_dtype = accumulate_in_router_dtype
 
     def __len__(self):
         return self._num_experts
@@ -71,7 +78,11 @@ class _UnfusedExperts(nn.Module):
         if top_k_weights is None:
             top_k_weights = routing_weights
 
-        final_hidden_states = torch.zeros_like(hidden_states)
+        # getattr: modules pickled by older versions lack the attribute.
+        in_router_dtype = getattr(self, "accumulate_in_router_dtype", False)
+        final_hidden_states = torch.zeros_like(
+            hidden_states, dtype=top_k_weights.dtype if in_router_dtype else None
+        )
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(
                 top_k_index,
@@ -91,12 +102,15 @@ class _UnfusedExperts(nn.Module):
             current_state = hidden_states[token_idx]
 
             expert = self[expert_idx]
-            gate = expert.gate_proj(current_state)
-            up = expert.up_proj(current_state)
-            if self.combine_fn is not None:
-                current_hidden_states = self.combine_fn(gate, up)
+            if expert.gate_proj is None:
+                current_hidden_states = self.act_fn(expert.up_proj(current_state))
             else:
-                current_hidden_states = self.act_fn(gate) * up
+                gate = expert.gate_proj(current_state)
+                up = expert.up_proj(current_state)
+                if self.combine_fn is not None:
+                    current_hidden_states = self.combine_fn(gate, up)
+                else:
+                    current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = expert.down_proj(current_hidden_states)
 
             current_hidden_states = (
@@ -108,7 +122,7 @@ class _UnfusedExperts(nn.Module):
                 current_hidden_states.to(final_hidden_states.dtype),
             )
 
-        return final_hidden_states
+        return final_hidden_states.to(hidden_states.dtype)
 
 
 class _GenericFusedExperts(nn.Module):
@@ -133,8 +147,30 @@ def _is_fused_experts(module: nn.Module) -> bool:
     )
 
 
+def _is_non_gated_fused_experts(module: nn.Module) -> bool:
+    """Return True if module holds fused 3D up/down expert parameters without a gate.
+
+    NemotronH stores ``up_proj`` ``[E, inter, in]`` and ``down_proj``
+    ``[E, in, inter]`` and computes ``down_proj(act_fn(up_proj(x)))``.
+    """
+    if getattr(module, "gate_up_proj", None) is not None:
+        return False
+    up = getattr(module, "up_proj", None)
+    down = getattr(module, "down_proj", None)
+    return (
+        isinstance(up, nn.Parameter)
+        and isinstance(down, nn.Parameter)
+        and up.ndim == 3
+        and down.ndim == 3
+    )
+
+
 def _is_unfused_experts(module: nn.Module) -> bool:
     return isinstance(module, _UnfusedExperts)
+
+
+def _is_non_gated_unfused_experts(module: nn.Module) -> bool:
+    return _is_unfused_experts(module) and len(module) > 0 and module[0].gate_proj is None
 
 
 @lru_cache(maxsize=1)
@@ -493,6 +529,31 @@ def _unfuse_one(module: nn.Module) -> _UnfusedExperts:
     return result
 
 
+def _unfuse_non_gated_one(module: nn.Module) -> _UnfusedExperts:
+    """Convert non-gated fused experts (e.g. NemotronH) to per-expert nn.Linear."""
+    up_3d = module.up_proj.data  # [E, inter, in]
+    down_3d = module.down_proj.data  # [E, in, inter]
+    num_experts, inter, hidden = up_3d.shape
+    act_fn = module.act_fn
+    dtype = up_3d.dtype
+
+    experts = []
+    for i in range(num_experts):
+        up_proj = nn.Linear(hidden, inter, bias=False, dtype=dtype)
+        up_proj.weight = nn.Parameter(up_3d[i].contiguous())
+
+        down_proj = nn.Linear(inter, hidden, bias=False, dtype=dtype)
+        down_proj.weight = nn.Parameter(down_3d[i].contiguous())
+
+        experts.append(_ExpertMLP(None, up_proj, down_proj, act_fn))
+
+    result = _UnfusedExperts(num_experts, experts, act_fn, accumulate_in_router_dtype=True)
+
+    del module.up_proj, module.down_proj
+
+    return result
+
+
 def _fuse_gpt_oss_one(
     unfused: _UnfusedExperts,
     override: dict[str, torch.Tensor | float] | None = None,
@@ -642,7 +703,7 @@ def unfuse_moe_experts(model: nn.Module, logger: logging.Logger) -> bool:
     """
     replacements: list[tuple[str, nn.Module]] = []
     for name, module in model.named_modules():
-        if _is_fused_experts(module):
+        if _is_fused_experts(module) or _is_non_gated_fused_experts(module):
             replacements.append((name, module))
 
     if not replacements:
@@ -651,6 +712,8 @@ def unfuse_moe_experts(model: nn.Module, logger: logging.Logger) -> bool:
     for name, fused_module in replacements:
         if _is_gpt_oss_experts(fused_module):
             unfused = _unfuse_gpt_oss_one(fused_module)
+        elif _is_non_gated_fused_experts(fused_module):
+            unfused = _unfuse_non_gated_one(fused_module)
         else:
             unfused = _unfuse_one(fused_module)
         *parent_path, attr = name.split(".")
@@ -663,7 +726,7 @@ def unfuse_moe_experts(model: nn.Module, logger: logging.Logger) -> bool:
             "Unfused %s: %d experts -> %d nn.Linear layers",
             name,
             num,
-            num * 3,
+            sum(isinstance(m, nn.Linear) for m in unfused.modules()),
         )
 
     return True
@@ -690,9 +753,21 @@ def fuse_moe_experts(
         True if at least one module was fused, False otherwise.
     """
     replacements: list[tuple[str, _UnfusedExperts]] = []
+    non_gated: list[str] = []
     for name, module in model.named_modules():
-        if _is_unfused_experts(module):
+        if _is_non_gated_unfused_experts(module):
+            non_gated.append(name)
+        elif _is_unfused_experts(module):
             replacements.append((name, module))
+
+    if non_gated:
+        # No fused (vLLM) layout is defined for non-gated experts, and
+        # dequantizing them densely would undo the quantization.
+        logger.warning(
+            "Keeping %d non-gated MoE expert module(s) unfused (e.g. %s)",
+            len(non_gated),
+            non_gated[0],
+        )
 
     if not replacements:
         return False

@@ -14,8 +14,9 @@ from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from accelerate import init_empty_weights
 from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from .quantizer.dbf.config import resolve_dbf_layer_bits
@@ -29,6 +30,7 @@ from .utils.device import get_default_device
 from .utils.dtype import needs_bfloat16
 from .utils.lora import LORA_ADAPTER_SUBDIR
 from .utils.quant_config import get_quant_param, validate_quant_config
+from .utils.quantized_compat import add_weight_placeholders_to_mamba_projections
 from .utils.unfuse_moe import unfuse_moe_experts
 
 logger = getLogger(__name__)
@@ -120,8 +122,12 @@ class QuantizedModelLoader:
                 logger.info("Expanded legacy deduped MoE keys for load")
             else:
                 logger.info("Loading fused MoE expert tensors (skipping unfuse)")
-        elif unfuse_moe_experts(model, logger):
-            logger.info("Unfused MoE expert tensors for quantized model load")
+        else:
+            # meta: do not allocate per-expert weights that are replaced anyway
+            with torch.device("meta"):
+                unfused = unfuse_moe_experts(model, logger)
+            if unfused:
+                logger.info("Unfused MoE expert tensors for quantized model load")
 
         # Align checkpoint key prefixes with the empty model built from config.
         # Gemma3 VLMs are a common case: weights saved from from_pretrained
@@ -142,6 +148,7 @@ class QuantizedModelLoader:
         # critical language-model and quantized-buffer mismatches must fail fast.
         incompat = model.load_state_dict(state_dict, strict=False, assign=True)
         cls._retie_lm_head_if_needed(model, incompat)
+        cls._init_missing_tensors(model)
 
         # Safety net: ``load_state_dict(..., assign=True)`` only replaces
         # parameters whose key in the checkpoint exactly matches the model's
@@ -170,6 +177,7 @@ class QuantizedModelLoader:
             )
 
         cls._assert_quantized_modules_loaded(model)
+        add_weight_placeholders_to_mamba_projections(model)
 
         cls._load_generation_config(model, save_directory)
         from .utils.unfuse_moe import _cast_fused_moe_parameters, _purge_orphan_parameters
@@ -371,8 +379,11 @@ class QuantizedModelLoader:
         if not os.path.isfile(config_path):
             raise FileNotFoundError(f"config.json not found in {save_directory}")
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_dict = json.load(f)
+        # Decodes special floats saved by transformers, e.g. NemotronH's
+        # time_step_limit [0.0, {"__float__": "Infinity"}].
+        config_dict = PretrainedConfig._dict_from_json_file(  # pylint: disable=protected-access
+            config_path
+        )
 
         quant_config = config_dict.get("quantization_config")
         validate_quant_config(quant_config, "config.json")
@@ -566,21 +577,62 @@ class QuantizedModelLoader:
         dtype = torch_dtype if torch_dtype is not None else torch.float16
         config_cls = CONFIG_MAPPING[model_type]
         model_config = config_cls.from_dict(clean_config)
-        try:
-            return AutoModelForCausalLM.from_config(model_config, dtype=dtype)
-        except (ValueError, KeyError):
-            from transformers import AutoModelForImageTextToText
+        # Parameters stay on the meta device until load_state_dict(assign=True)
+        # replaces them (tensors missing from the checkpoint are initialized by
+        # _init_missing_tensors), so e.g. fused MoE experts that are unfused
+        # right away are never allocated.
+        with init_empty_weights(include_buffers=False):
+            try:
+                return AutoModelForCausalLM.from_config(model_config, dtype=dtype)
+            except (ValueError, KeyError):
+                from transformers import AutoModelForImageTextToText
 
-            return AutoModelForImageTextToText.from_config(model_config, dtype=dtype)
+                return AutoModelForImageTextToText.from_config(model_config, dtype=dtype)
+
+    @staticmethod
+    def _init_missing_tensors(model: torch.nn.Module) -> None:
+        """Allocate and initialize tensors that the checkpoint did not provide.
+
+        The empty model is built on the meta device, so parameters missing
+        from the checkpoint are still meta after loading.  They are
+        initialized with the model's ``_init_weights`` as ``from_config``
+        would have done; loaded tensors of the same module are flagged with
+        ``_is_hf_initialized`` (like ``from_pretrained``) so they are kept.
+        """
+        init_weights = getattr(model, "_init_weights", None)
+        for module in model.modules():
+            tensor_dicts = (
+                module._parameters,
+                module._buffers,
+            )  # pylint: disable=protected-access
+            if not any(t is not None and t.is_meta for d in tensor_dicts for t in d.values()):
+                continue
+            for tensors in tensor_dicts:
+                for name, tensor in tensors.items():
+                    if tensor is None:
+                        continue
+                    if not tensor.is_meta:
+                        tensor._is_hf_initialized = True  # pylint: disable=protected-access
+                        continue
+                    value = torch.zeros_like(tensor, device="cpu")
+                    if isinstance(tensor, torch.nn.Parameter):
+                        value = torch.nn.Parameter(value, requires_grad=tensor.requires_grad)
+                    tensors[name] = value
+            if init_weights is not None:
+                init_weights(module)
 
     @staticmethod
     def _set_module_by_name(
         model: torch.nn.Module, full_name: str, module: torch.nn.Module
     ) -> None:
         """Replace the submodule at *full_name* (dotted path) with *module*."""
-        name_to_module = dict(model.named_modules())
         parent_name, _, child_name = full_name.rpartition(".")
-        parent = name_to_module.get(parent_name, model)
+        try:
+            # get_submodule instead of a named_modules() scan per call: MoE
+            # models replace tens of thousands of expert layers.
+            parent = model.get_submodule(parent_name)
+        except AttributeError:
+            parent = model
         setattr(parent, child_name, module)
 
     @classmethod
@@ -614,6 +666,15 @@ class QuantizedModelLoader:
         ) and all(key in model_keys for key in state_dict):
             return state_dict
 
+        # Every string that some model key ends with, within its last dotted
+        # component.  Lets _resolve_state_dict_key skip checkpoint keys that
+        # cannot match any model key (e.g. ``.qweight``) without scanning all
+        # keys, which is quadratic for MoE models with ~100k keys.
+        tail_suffixes = set()
+        for name in model_keys:
+            last = name.rpartition(".")[2]
+            tail_suffixes.update(last[i:] for i in range(len(last) + 1))
+
         remapped: dict = {}
         rewrite_count = 0
         for ckpt_key, tensor in state_dict.items():
@@ -621,7 +682,7 @@ class QuantizedModelLoader:
                 remapped[ckpt_key] = tensor
                 continue
 
-            target_key = cls._resolve_state_dict_key(ckpt_key, model_keys)
+            target_key = cls._resolve_state_dict_key(ckpt_key, model_keys, tail_suffixes)
             if target_key is not None and target_key != ckpt_key:
                 remapped[target_key] = tensor
                 rewrite_count += 1
@@ -665,13 +726,18 @@ class QuantizedModelLoader:
         return candidates[0] if candidates else None
 
     @staticmethod
-    def _resolve_state_dict_key(ckpt_key: str, model_keys: set) -> Optional[str]:
+    def _resolve_state_dict_key(
+        ckpt_key: str, model_keys: set, tail_suffixes: Optional[set] = None
+    ) -> Optional[str]:
         """Return the remapped key for ckpt_key, or None if unknown.
 
         Important:
             Only return a candidate if it exists in model_keys. Quantized
             buffers do not exist before _replace_quantized_layers(), so they
             are handled in _replace_quantized_layers() instead.
+
+        ``tail_suffixes`` (see _remap_state_dict_keys) only short-cuts keys
+        that no model key can end with; the result is unchanged.
         """
         for candidate in QuantizedModelLoader._known_state_dict_key_rewrite_candidates(ckpt_key):
             if candidate in model_keys:
@@ -682,6 +748,9 @@ class QuantizedModelLoader:
         # deeper match is preferred over a shorter one that happens to be
         # unique only by coincidence.
         parts = ckpt_key.split(".")
+        if tail_suffixes is not None and parts[-1] not in tail_suffixes:
+            # Every suffix below ends with parts[-1], which no model key does.
+            return None
         for start in range(len(parts)):
             suffix = ".".join(parts[start:])
             hits = [name for name in model_keys if name.endswith(suffix)]

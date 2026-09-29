@@ -1,5 +1,32 @@
 # Change log
 
+## [v1.4.0(WIP)+feature/nemotron] 2026-09-29
+
+### New Features
+
+- Support NVIDIA ModelOpt checkpoints (`quant_method="modelopt"`, FP8 / NVFP4 / `MIXED_PRECISION`)
+  such as `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4`. FP8 layers are dequantized to
+  bfloat16 at load time; NVFP4 layers stay packed on CPU and are dequantized on the GPU one
+  transformer block at a time during QEP and evaluation.
+- Support non-gated MoE experts (NemotronH `up_proj` / `down_proj` with ReLU²) in MoE unfuse
+  and QEP quantization. `fuse_moe_experts` keeps them as per-expert (quantized) layers.
+- `Runner.calculate_perplexity` evaluates ModelOpt models and created quantized models that do
+  not fit on the GPU block by block (`calculate_perplexity_offloaded`).
+- Add `example/example_qep_gptq_nemotron_nvfp4.py`.
+
+### Enhancement
+
+- Compute per-expert Hessians in QEP in chunks that fit in the free GPU memory, and
+  dequantize GPTQ results on the GPU when updating the block weights.
+- Make quantized Mamba `in_proj` / `out_proj` (`GPTQLinear`) usable in transformers' Mamba2
+  mixers (models from `Runner.create_quantized_model` and `QuantizedModelLoader`).
+- Save and reload quantized NemotronH models: non-gated experts are saved as per-expert GPTQ
+  layers, and `QuantizedModelLoader` decodes special floats in `config.json` (e.g.
+  `time_step_limit`).
+- `QuantizedModelLoader` builds the empty model on the meta device (tensors missing from the
+  checkpoint are initialized as before), and no longer scales quadratically with the number
+  of layers when remapping keys / replacing quantized layers.
+
 ## [v1.4.0(WIP)+feature/mdbf-llamacpp-export] 2026-09-10
 
 ### New Features

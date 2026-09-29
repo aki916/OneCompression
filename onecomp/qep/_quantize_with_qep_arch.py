@@ -39,9 +39,13 @@ from onecomp.utils.blockwise import (
     prepare_block_kwargs,
 )
 from onecomp.utils.device import empty_cache
+from onecomp.utils.modelopt_checkpoint import materialize_lazy_weights, release_lazy_weights
 from onecomp.utils.quantization_progress import QuantizationProgressTracker
 
 logger = getLogger(__name__)
+
+# Fraction of the free CUDA memory that per-expert Hessians may use at once.
+_EXPERT_HESSIAN_MEMORY_FRACTION = 0.5
 
 
 def make_grouped_module(
@@ -272,6 +276,52 @@ def _compute_per_module_hessians(
     }
 
 
+def _chunk_expert_modules(
+    expert_modules: list[nn.Module],
+    module_to_name: dict[nn.Module, str],
+    device: torch.device,
+) -> list[list[nn.Module]]:
+    """Split expert layers into chunks whose FP32 Hessians fit in CUDA memory.
+
+    All projections of one expert stay in the same chunk.  Chunking does not
+    change the result: an expert's inputs never depend on the other experts
+    of the same MoE layer, and each chunk's Hessians are computed before any
+    of its layers is quantized.  Non-CUDA devices use a single chunk.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return [list(expert_modules)]
+
+    by_expert: OrderedDict[str, list[nn.Module]] = OrderedDict()
+    for module in expert_modules:
+        by_expert.setdefault(module_to_name[module].rpartition(".")[0], []).append(module)
+
+    budget = torch.cuda.mem_get_info(device)[0] * _EXPERT_HESSIAN_MEMORY_FRACTION
+    chunks: list[list[nn.Module]] = [[]]
+    chunk_bytes = 0
+    for modules in by_expert.values():
+        nbytes = sum(4 * m.in_features**2 for m in modules)
+        if chunks[-1] and chunk_bytes + nbytes > budget:
+            chunks.append([])
+            chunk_bytes = 0
+        chunks[-1].extend(modules)
+        chunk_bytes += nbytes
+    return chunks
+
+
+def _dequantized_weight(result, device) -> torch.Tensor:
+    """Return the dequantized weight of *result* on *device*.
+
+    GPTQ results are unpacked on *device*: on CPU this takes ~0.7 s for one
+    5120x2048 3-bit layer, i.e. hours for the ~50k expert layers of
+    Nemotron 3 Ultra.  Integer unpacking and ``scale * (q - zero)`` give the
+    same values on any device.
+    """
+    if isinstance(result, GPTQResult):
+        return result.compute_dequantized_weight(device=device).to(device)
+    return result.compute_dequantized_weight().to(device)
+
+
 def _resolve_gptq_for_rtn_fallback(quantizer: Quantizer, module: nn.Module) -> Optional[GPTQ]:
     """Return the GPTQ instance to use for the no-tokens RTN fallback, if any.
 
@@ -400,6 +450,9 @@ def run_quantize_with_qep_arch(
 
         block_q = block.to(device)
         block_f = copy.deepcopy(block_q)
+        # Lazily dequantized layers (NVFP4Linear) need a dense weight to be
+        # quantized; block_f keeps dequantizing them on the fly.
+        materialize_lazy_weights(block_q)
 
         groups_q = make_grouped_module(block_q, inps_q, kwargs, device)
 
@@ -522,8 +575,8 @@ def run_quantize_with_qep_arch(
                 # Update the weights of the target layer
                 try:
                     dtype = module.weight.data.dtype
-                    module.weight.data = (
-                        quantizer.results[name].compute_dequantized_weight().to(device).to(dtype)
+                    module.weight.data = _dequantized_weight(quantizer.results[name], device).to(
+                        dtype
                     )
                 except (ValueError, NotImplementedError):
                     logger.error(
@@ -542,17 +595,27 @@ def run_quantize_with_qep_arch(
                 "(weight correction disabled for expert layers)",
                 len(expert_modules_q),
             )
-            expert_hessians = _compute_per_module_hessians(
-                block_q,
-                expert_modules_q,
-                inps_q,
-                kwargs,
-                batch_size,
-                device,
+            # The Hessians of all experts may not fit in memory at once (e.g.
+            # 512 experts per layer), so they are computed one chunk at a time.
+            expert_chunks = _chunk_expert_modules(
+                expert_modules_q, quantizer.module_to_name, device
             )
-            for module_q in expert_modules_q:
+            if len(expert_chunks) > 1:
+                logger.info("Splitting expert Hessians into %d chunks", len(expert_chunks))
+            chunk_by_first_module = {chunk[0]: chunk for chunk in expert_chunks}
+            expert_hessians = {}
+            for module_q in [m for chunk in expert_chunks for m in chunk]:
+                if module_q in chunk_by_first_module:
+                    expert_hessians = _compute_per_module_hessians(
+                        block_q,
+                        chunk_by_first_module[module_q],
+                        inps_q,
+                        kwargs,
+                        batch_size,
+                        device,
+                    )
                 name = quantizer.module_to_name[module_q]
-                entry = expert_hessians[module_q]
+                entry = expert_hessians.pop(module_q)
                 if entry is None:
                     fallback_quantizer = _resolve_gptq_for_rtn_fallback(quantizer, module_q)
                     if fallback_quantizer is not None:
@@ -592,8 +655,8 @@ def run_quantize_with_qep_arch(
                     )
                 try:
                     dtype = module_q.weight.data.dtype
-                    module_q.weight.data = (
-                        quantizer.results[name].compute_dequantized_weight().to(device).to(dtype)
+                    module_q.weight.data = _dequantized_weight(quantizer.results[name], device).to(
+                        dtype
                     )
                 except (ValueError, NotImplementedError):
                     logger.error(
@@ -613,7 +676,9 @@ def run_quantize_with_qep_arch(
         mse = F.mse_loss(inps_q.float(), inps_f.float()).item()
         logger.info("Block %d MSE: %.6e", block_idx + 1, mse)
 
-        # free memory
+        # free memory (materialized lazy weights are dropped, not copied to
+        # CPU: their quantized values live in quantizer.results)
+        release_lazy_weights(block_q)
         block_q.cpu()
         empty_cache(device)
 

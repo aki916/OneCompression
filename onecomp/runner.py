@@ -34,8 +34,15 @@ from .utils import calculate_perplexity as calc_perplexity
 from .utils import empty_cache
 from .utils.device import is_mps_device
 from .utils.lora import LORA_ADAPTER_SUBDIR
+from .utils.offload import module_nbytes
+from .utils.perplexity import calculate_perplexity_offloaded as calc_perplexity_offloaded
 from .utils.quant_config import get_quant_param, validate_quantized_model_config
 from .utils.quantization_progress import QuantizationProgressTracker
+from .utils.quantized_compat import add_weight_placeholders_to_mamba_projections
+from .utils.unfuse_moe import _is_non_gated_unfused_experts
+
+# Models above this fraction of the CUDA device memory are evaluated block by block.
+_OFFLOADED_EVAL_MEMORY_FRACTION = 0.8
 
 
 def _get_num_experts(config):
@@ -1101,6 +1108,7 @@ class Runner:
         eval_function,
         eval_args: dict,
         quantizer: Quantizer | None,
+        offloaded_eval_function=None,
     ) -> tuple:
         """Calculate the evaluation metric (perplexity or accuracy).
 
@@ -1110,6 +1118,10 @@ class Runner:
         ``load_model()`` calls, and calling both ``calculate_perplexity()``
         and ``calculate_accuracy()`` will load models independently as well.
         This trade-off prioritises correctness over load-time efficiency.
+
+        Original (ModelOpt) and created quantized models that do not fit on
+        the CUDA device are evaluated with ``offloaded_eval_function``, which
+        moves one transformer block at a time to the device.
         """
         logger = self.logger
 
@@ -1128,9 +1140,17 @@ class Runner:
 
         if original_model:
             logger.info("Evaluating original model (%s)...", eval_name)
-            model = self.model_config.load_model()
+            # ModelOpt checkpoints are loaded on CPU: they may not fit on the
+            # device (e.g. NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4).
+            load_on_cpu = self.model_config.is_modelopt_checkpoint()
+            model = self.model_config.load_model(device_map="cpu" if load_on_cpu else None)
             tokenizer = self.model_config.load_tokenizer()
-            original_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
+            if load_on_cpu:
+                original_result = self._evaluate_cpu_model(
+                    model, tokenizer, eval_name, eval_function, offloaded_eval_function, eval_args
+                )
+            else:
+                original_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
             del model, tokenizer
             empty_cache(self.model_config.get_device())
 
@@ -1146,8 +1166,14 @@ class Runner:
                     del tokenizer
                 else:
                     model, tokenizer = self.create_quantized_model(quantizer=quantizer)
-                    model.to(self.model_config.get_device())
-                    quantized_result = eval_function(model=model, tokenizer=tokenizer, **eval_args)
+                    quantized_result = self._evaluate_cpu_model(
+                        model,
+                        tokenizer,
+                        eval_name,
+                        eval_function,
+                        offloaded_eval_function,
+                        eval_args,
+                    )
                     del model, tokenizer
                 empty_cache(self.model_config.get_device())
             except NotImplementedError:
@@ -1173,6 +1199,31 @@ class Runner:
             empty_cache(self.model_config.get_device())
 
         return original_result, dequantized_result, quantized_result
+
+    def _evaluate_cpu_model(
+        self, model, tokenizer, eval_name, eval_function, offloaded_eval_function, eval_args
+    ):
+        """Evaluate a model on CPU on the device, block by block if it does not fit."""
+        device = self.model_config.get_device()
+        if (
+            device.type == "cuda"
+            and module_nbytes(model)
+            > _OFFLOADED_EVAL_MEMORY_FRACTION
+            * torch.cuda.get_device_properties(device).total_memory
+        ):
+            if offloaded_eval_function is None:
+                raise ValueError(
+                    f"The model does not fit on {device}, and block-wise {eval_name} "
+                    "evaluation is not supported."
+                )
+            self.logger.info(
+                "Model does not fit on %s; evaluating %s block by block", device, eval_name
+            )
+            return offloaded_eval_function(
+                model=model, tokenizer=tokenizer, device=device, **eval_args
+            )
+        model.to(device)
+        return eval_function(model=model, tokenizer=tokenizer, **eval_args)
 
     def calculate_perplexity(
         self,
@@ -1254,6 +1305,7 @@ class Runner:
             eval_function=calc_perplexity,
             eval_args=calculate_perplexity_args,
             quantizer=quantizer,
+            offloaded_eval_function=calc_perplexity_offloaded,
         )
 
     def benchmark_perplexity(
@@ -1788,7 +1840,7 @@ class Runner:
             )
 
         if num_experts > 0:
-            if self.moe_quant_experts:
+            if self._keeps_quantized_moe_experts(model):
                 # Keep experts as per-expert GPTQLinear tensors (4-bit) and leave
                 # them in the quant config so the mixed_gptq vLLM plugin serves
                 # them via GPTQMarlinMoEMethod.  No fuse/dequantize/strip.
@@ -1807,10 +1859,24 @@ class Runner:
         # fused qkv_proj consistency check passes.
         self._patch_k_eq_v_for_vllm(model, quant_config)
 
+        # transformers' Mamba2 mixers (e.g. NemotronH) read in_proj.weight /
+        # out_proj.weight, which quantized layers such as GPTQLinear lack.
+        add_weight_placeholders_to_mamba_projections(model)
+
         # Add quantization config to model config
         model.config.quantization_config = quant_config
 
         return model, tokenizer
+
+    def _keeps_quantized_moe_experts(self, model) -> bool:
+        """Return True if MoE experts stay per-expert quantized layers when saved.
+
+        Besides ``moe_quant_experts=True``, this is always the case for
+        non-gated experts (e.g. NemotronH), which have no fused layout.
+        """
+        return self.moe_quant_experts or any(
+            _is_non_gated_unfused_experts(m) for _, m in model.named_modules()
+        )
 
     def _patch_k_eq_v_for_vllm(self, model, quant_config: dict) -> None:
         """Add synthetic v_proj weights and config for attention_k_eq_v layers.
@@ -2360,7 +2426,7 @@ class Runner:
             model.config = orig_model_config_for_restore
 
         if num_experts > 0:
-            if self.moe_quant_experts:
+            if self._keeps_quantized_moe_experts(model):
                 from .utils.unfuse_moe import verify_saved_moe_quant_checkpoint
 
                 n_experts = verify_saved_moe_quant_checkpoint(save_directory)
@@ -2830,7 +2896,7 @@ class Runner:
         # now-absent per-expert modules.  Idempotent: a no-op when the model is
         # already fused/stripped (create_quantized_model handles this on the normal
         # path); this is the safety net for the self.quantized_model path.
-        if _get_num_experts(model.config) > 0 and not self.moe_quant_experts:
+        if _get_num_experts(model.config) > 0 and not self._keeps_quantized_moe_experts(model):
             from .utils.unfuse_moe import (
                 fuse_moe_experts,
                 strip_moe_experts_from_quant_config,
