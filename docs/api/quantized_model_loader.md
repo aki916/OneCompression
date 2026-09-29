@@ -11,6 +11,21 @@ inference; vLLM requires Linux with an NVIDIA GPU. See the
     options:
       show_source: false
 
+## Nemotron-H ModelOpt checkpoints
+
+For NVIDIA Nemotron-3 Ultra converted with QEP/GPTQ, use the safetensors
+`load_quantized_model()` API. The loader creates the architecture on the meta
+device and assigns saved weights, keeping individual MoE experts packed. It
+checks that Mamba parameters, router weights, and other required tensors are
+present before returning an evaluation-mode model.
+
+`device_map="cpu"` keeps the model on CPU; `device_map="auto"` distributes it
+with Accelerate while keeping each hybrid decoder block together. An explicit
+module-to-device dictionary is also accepted. Sufficient memory for the packed
+weights and inference working space is still required. See the
+[Nemotron QEP example](../algorithms/qep.md#nemotron-h-modelopt-nvfp4fp8-checkpoints)
+for saving and generation usage.
+
 ## Convenience Functions
 
 The top-level aliases provide shortcuts for both formats:

@@ -639,7 +639,10 @@ class GPTQLinear(nn.Module):
         empty: bool = False,
         checkpoint_format: str = "gptq",
     ):
-        """Build GPTQLinear from saved state_dict tensors (AutoGPTQ format).
+        """Build GPTQLinear from packed or unpacked saved state_dict tensors.
+
+        The saved weight shape distinguishes dense INT weights from packed
+        AutoGPTQ storage, including checkpoints saved with pack_weights=False.
 
         Args:
             layer_state_dict: Sub-state_dict for this layer (keys: qweight, scales, qzeros, etc.)
@@ -668,9 +671,27 @@ class GPTQLinear(nn.Module):
         self.groupsize = groupsize
         self.actorder = actorder
         self.checkpoint_format = checkpoint_format
-        # JointQ wbits=1 is saved with pack_weights=False
-        # (GPTQLinear packing does not support 1-bit), so load it unpacked as well.
-        self._weight_is_packed = wbits != 1
+        qweight = layer_state_dict["qweight"]
+        if tuple(qweight.shape) == (out_features, in_features):
+            # Both constructor/save(pack_weights=False) and unpack_in_place
+            # produce this layout at any bit width. Packed AutoGPTQ weights
+            # use (in_features * wbits / 32, out_features), which cannot equal
+            # the dense shape for supported bit widths below 32.
+            self._weight_is_packed = False
+            expected_zeros = (layer_state_dict["scales"].shape[0], out_features)
+            if tuple(layer_state_dict["qzeros"].shape) != expected_zeros:
+                raise ValueError(
+                    "Unpacked GPTQ qweight requires unpacked qzeros with shape "
+                    f"{expected_zeros}, got {tuple(layer_state_dict['qzeros'].shape)}."
+                )
+        elif is_packable_wbits(wbits) and qweight.dtype == torch.int32:
+            self._weight_is_packed = True
+        else:
+            raise ValueError(
+                "Invalid GPTQ qweight layout: expected dense "
+                f"{(out_features, in_features)} or packed INT32 weights for "
+                f"wbits={wbits}, got shape={tuple(qweight.shape)}, dtype={qweight.dtype}."
+            )
 
         def _t(k):
             t = layer_state_dict[k]
@@ -682,21 +703,27 @@ class GPTQLinear(nn.Module):
         self.register_buffer("qzeros", _t("qzeros"))
 
         g_idx = layer_state_dict.get("g_idx")
+        perm = layer_state_dict.get("perm")
         if g_idx is not None:
             self.register_buffer("g_idx", torch.zeros_like(g_idx) if empty else g_idx)
         else:
             if groupsize != -1:
-                self.register_buffer(
-                    "g_idx",
-                    torch.arange(in_features, dtype=torch.int32, device=dev) // groupsize,
-                )
+                if actorder:
+                    if perm is None:
+                        raise ValueError(
+                            "Grouped actorder GPTQ checkpoints require g_idx or perm "
+                            "to restore the activation-order group assignment."
+                        )
+                    g_idx = (torch.argsort(perm) // groupsize).to(dtype=torch.int32, device=dev)
+                else:
+                    g_idx = torch.arange(in_features, dtype=torch.int32, device=dev) // groupsize
+                self.register_buffer("g_idx", g_idx)
             else:
                 self.register_buffer(
                     "g_idx",
                     torch.zeros(in_features, dtype=torch.int32, device=dev),
                 )
 
-        perm = layer_state_dict.get("perm")
         if perm is not None:
             self.register_buffer("perm", torch.zeros_like(perm) if empty else perm)
         else:

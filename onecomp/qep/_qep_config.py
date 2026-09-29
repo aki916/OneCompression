@@ -30,6 +30,12 @@ class QEPConfig:
             layers excluded from error propagation. Layers whose names
             contain any of these keywords will be excluded.
             Default is ``["mlp.down_proj"]``.
+        batch_size (int): Number of calibration sequences per block forward.
+            Reduce this for large hybrid or MoE models. Default is 16.
+        expert_hessian_max_bytes (int): Maximum combined float32 Hessian
+            storage for one group of MoE expert projections. Groups are
+            calibrated and quantized sequentially. A single projection may
+            exceed this limit. Default is 1 GiB.
 
     Examples:
         >>> config = QEPConfig()
@@ -54,4 +60,12 @@ class QEPConfig:
     perccorr: float = 0.5
     device: str = None
     exclude_layer_keywords: list[str] = field(default_factory=lambda: ["mlp.down_proj"])
+    batch_size: int = 16
+    expert_hessian_max_bytes: int = 1 << 30
     # TODO: exclude_layer_keywords depends on the architecture and needs to be fixed
+
+    def __post_init__(self):
+        for name in ("batch_size", "expert_hessian_max_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")

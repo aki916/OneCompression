@@ -6,6 +6,7 @@ Author: Keiji Kimura
 
 """
 
+import copy
 from logging import getLogger
 
 import torch
@@ -80,6 +81,65 @@ class ModelConfig:
                 self.get_model_id_or_path(), trust_remote_code=True
             )
         return self._cached_config
+
+    def uses_layerwise_loading(self):
+        """Whether QEP should dequantize the source checkpoint one block at a time.
+
+        Nemotron Ultra's ModelOpt checkpoint mixes NVFP4 and FP8 weights.
+        Materializing all of them in BF16 would require over 1 TB of RAM.
+        """
+        config = self.load_config()
+        qcfg = getattr(config, "quantization_config", None)
+        return (
+            config.model_type == "nemotron_h"
+            and isinstance(qcfg, dict)
+            and qcfg.get("quant_method") == "modelopt"
+        )
+
+    def load_model_for_quantization(self):
+        """Load a CPU model, or a lazy ModelOpt skeleton for architecture-aware QEP.
+
+        The lazy model contains only its input embeddings. QEP materializes
+        each block using ``_onecomp_checkpoint`` and releases it afterwards.
+        It must not be used for ordinary model inference.
+        """
+        if not self.uses_layerwise_loading():
+            return self.load_model(device_map="cpu")
+
+        from .utils.modelopt_checkpoint import ModelOptCheckpoint
+        from .utils.unfuse_moe import unfuse_moe_experts
+
+        config = copy.deepcopy(self.load_config())
+        del config.quantization_config
+        config.use_cache = False
+        # Some ModelOpt JSON exports encode non-finite values explicitly.
+        config.time_step_limit = tuple(
+            float(value["__float__"]) if isinstance(value, dict) else value
+            for value in config.time_step_limit
+        )
+        # Native Transformers implements the causal LM backbone; MTP weights
+        # are auxiliary prediction heads and are not used for QEP calibration.
+        config.num_nextn_predict_layers = 0
+        reader = ModelOptCheckpoint(self.get_model_id_or_path(), dtype=torch.bfloat16)
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16)
+            unfuse_moe_experts(model, self.logger)
+        # ModelOpt stores the router in FP32. Preserve routing decisions rather
+        # than rounding these unquantized weights to the backbone's BF16 dtype.
+        for name, module in model.named_modules():
+            if name.endswith(".mixer.gate"):
+                module.float()
+        model.eval()
+
+        embeddings = model.get_input_embeddings()
+        prefix = next(name for name, module in model.named_modules() if module is embeddings)
+        reader.load_module(embeddings, prefix, device="cpu")
+        model._onecomp_checkpoint = reader
+        self.logger.info(
+            "Loading ModelOpt Nemotron in BF16 one block at a time for QEP; "
+            "auxiliary MTP heads are excluded."
+        )
+        return model
 
     def load_model(self, device_map=None):
         """Load the model

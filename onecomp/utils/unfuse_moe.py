@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-_MOE_EXPERT_KEY_RE = re.compile(r"\.mlp\.experts\.")
+_MOE_EXPERT_KEY_RE = re.compile(r"\.(?:mlp|mixer)\.experts\.")
 
 
 class _ExpertMLP(nn.Module):
@@ -111,6 +111,52 @@ class _UnfusedExperts(nn.Module):
         return final_hidden_states
 
 
+class _NonGatedExpertMLP(nn.Module):
+    """Nemotron-H expert, including the optional reduced latent width."""
+
+    def __init__(self, up_proj: nn.Linear, down_proj: nn.Linear):
+        super().__init__()
+        self.up_proj = up_proj
+        self.down_proj = down_proj
+
+
+class _UnfusedNonGatedExperts(_UnfusedExperts):
+    """Nemotron-H experts with Linear hooks and FP32 routing accumulation."""
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        output = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
+        # A one-hot routing tensor scales with all 512 experts. Compare only
+        # the selected IDs to keep temporary storage proportional to tokens*k.
+        for expert_idx in torch.unique(top_k_index).tolist():
+            top_k_pos, token_idx = torch.where(top_k_index.T == expert_idx)
+            expert = self[expert_idx]
+            current = expert.up_proj(hidden_states[token_idx])
+            current = expert.down_proj(self.act_fn(current))
+            current = current * top_k_weights[token_idx, top_k_pos, None]
+            output.index_add_(0, token_idx, current.to(output.dtype))
+        return output.to(hidden_states.dtype)
+
+
+class _NonGatedFusedExperts(nn.Module):
+    """Fused non-gated expert tensors for checkpoint export."""
+
+    def __init__(self, up_proj, down_proj, act_fn):
+        super().__init__()
+        self.up_proj = nn.Parameter(up_proj)
+        self.down_proj = nn.Parameter(down_proj)
+        self.act_fn = act_fn
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        output = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
+        for expert_idx in torch.unique(top_k_index).tolist():
+            top_k_pos, token_idx = torch.where(top_k_index.T == expert_idx)
+            current = nn.functional.linear(hidden_states[token_idx], self.up_proj[expert_idx])
+            current = nn.functional.linear(self.act_fn(current), self.down_proj[expert_idx])
+            current = current * top_k_weights[token_idx, top_k_pos, None]
+            output.index_add_(0, token_idx, current.to(output.dtype))
+        return output.to(hidden_states.dtype)
+
+
 class _GenericFusedExperts(nn.Module):
     """Minimal fused MoE container for non-GPT-OSS architectures."""
 
@@ -124,6 +170,8 @@ class _GenericFusedExperts(nn.Module):
 def _is_fused_experts(module: nn.Module) -> bool:
     """Return True if module holds fused 3D expert parameters."""
     gate_up = getattr(module, "gate_up_proj", None)
+    if gate_up is None:
+        gate_up = getattr(module, "up_proj", None)
     down = getattr(module, "down_proj", None)
     return (
         isinstance(gate_up, nn.Parameter)
@@ -174,7 +222,13 @@ def _ensure_unique_fused_moe_parameters(model: nn.Module) -> None:
     for module in model.modules():
         if not (_is_gpt_oss_experts(module) or _is_fused_experts(module)):
             continue
-        for pname in ("gate_up_proj", "gate_up_proj_bias", "down_proj", "down_proj_bias"):
+        for pname in (
+            "gate_up_proj",
+            "gate_up_proj_bias",
+            "up_proj",
+            "down_proj",
+            "down_proj_bias",
+        ):
             param = getattr(module, pname, None)
             if not isinstance(param, nn.Parameter):
                 continue
@@ -206,7 +260,7 @@ def _purge_orphan_parameters(model: nn.Module) -> None:
 def _infer_fused_moe_dtype(model: nn.Module) -> torch.dtype | None:
     """Infer the activation dtype used by non-MoE layers in *model*."""
     for name, param in model.named_parameters():
-        if ".mlp.experts." in name:
+        if _MOE_EXPERT_KEY_RE.search(name):
             continue
         if param.dtype in (torch.float16, torch.bfloat16):
             return param.dtype
@@ -220,7 +274,13 @@ def _cast_fused_moe_parameters(model: nn.Module, dtype: torch.dtype | None) -> N
     for module in model.modules():
         if not (_is_gpt_oss_experts(module) or _is_fused_experts(module)):
             continue
-        for pname in ("gate_up_proj", "gate_up_proj_bias", "down_proj", "down_proj_bias"):
+        for pname in (
+            "gate_up_proj",
+            "gate_up_proj_bias",
+            "up_proj",
+            "down_proj",
+            "down_proj_bias",
+        ):
             param = getattr(module, pname, None)
             if isinstance(param, nn.Parameter) and param.dtype != dtype:
                 with torch.no_grad():
@@ -229,7 +289,10 @@ def _cast_fused_moe_parameters(model: nn.Module, dtype: torch.dtype | None) -> N
 
 def _checkpoint_uses_fused_moe(state_dict: dict[str, torch.Tensor]) -> bool:
     """Return True when the checkpoint stores fused 3D expert tensors."""
-    if any(k.endswith(".mlp.experts.gate_up_proj") for k in state_dict):
+    if any(
+        _MOE_EXPERT_KEY_RE.search(k) and k.endswith((".gate_up_proj", ".up_proj"))
+        for k in state_dict
+    ):
         return True
     if "gate_up_proj$" in state_dict or "down_proj$" in state_dict:
         return True
@@ -281,7 +344,8 @@ def validate_fused_moe_checkpoint_state_dict(
             continue
         if not (_is_gpt_oss_experts(module) or _is_fused_experts(module)):
             continue
-        for suffix in ("gate_up_proj", "down_proj"):
+        up_name = "gate_up_proj" if hasattr(module, "gate_up_proj") else "up_proj"
+        for suffix in (up_name, "down_proj"):
             key = f"{name}.{suffix}"
             if key not in state_dict:
                 missing.append(key)
@@ -324,7 +388,13 @@ def verify_saved_moe_checkpoint(save_directory: str | Path) -> int:
         with safe_open(str(shard_path), framework="pt") as f:
             keys.extend(f.keys())
 
-    layer_gate = [k for k in keys if k.endswith(".mlp.experts.gate_up_proj") and ".layers." in k]
+    layer_gate = [
+        k
+        for k in keys
+        if _MOE_EXPERT_KEY_RE.search(k)
+        and k.endswith((".gate_up_proj", ".up_proj"))
+        and ".layers." in k
+    ]
     bad_keys = [k for k in keys if k.endswith("$")]
     if bad_keys:
         raise RuntimeError(
@@ -363,7 +433,13 @@ def verify_saved_moe_quant_checkpoint(save_directory: str | Path) -> int:
             "Quant-experts MoE checkpoint has deduped keys: "
             f"{bad_keys[:5]}{'...' if len(bad_keys) > 5 else ''}"
         )
-    fused_dense = [k for k in keys if k.endswith(".mlp.experts.gate_up_proj") and ".layers." in k]
+    fused_dense = [
+        k
+        for k in keys
+        if _MOE_EXPERT_KEY_RE.search(k)
+        and k.endswith((".gate_up_proj", ".up_proj"))
+        and ".layers." in k
+    ]
     if fused_dense:
         raise RuntimeError(
             "Quant-experts MoE checkpoint unexpectedly contains dense fused "
@@ -463,8 +539,29 @@ def _unfuse_gpt_oss_one(module: nn.Module) -> _UnfusedExperts:
     return result
 
 
+def _unfuse_non_gated_one(module: nn.Module) -> _UnfusedNonGatedExperts:
+    up = module.up_proj.detach()
+    down = module.down_proj.detach()
+    num_experts, inter, hidden = up.shape
+    experts = []
+    for i in range(num_experts):
+        # Construct on meta to avoid allocating and initializing an extra copy
+        # of every expert. This also supports the streamed NVFP4 loader.
+        up_proj = nn.Linear(hidden, inter, bias=False, device="meta", dtype=up.dtype)
+        down_proj = nn.Linear(inter, hidden, bias=False, device="meta", dtype=down.dtype)
+        up_proj.weight = nn.Parameter(up[i], requires_grad=module.up_proj.requires_grad)
+        down_proj.weight = nn.Parameter(down[i], requires_grad=module.down_proj.requires_grad)
+        experts.append(_NonGatedExpertMLP(up_proj, down_proj))
+    result = _UnfusedNonGatedExperts(num_experts, experts, module.act_fn)
+    result.train(module.training)
+    del module.up_proj, module.down_proj
+    return result
+
+
 def _unfuse_one(module: nn.Module) -> _UnfusedExperts:
     """Convert a single fused-experts module to per-expert nn.Linear."""
+    if not hasattr(module, "gate_up_proj"):
+        return _unfuse_non_gated_one(module)
     gate_up_3d = module.gate_up_proj.data  # [E, 2*inter, hidden]
     down_3d = module.down_proj.data  # [E, hidden, inter]
     num_experts = gate_up_3d.shape[0]
@@ -576,6 +673,23 @@ def _fuse_one(
     override: dict[str, torch.Tensor] | None = None,
 ) -> nn.Module:
     """Convert per-expert nn.Linear layers back to generic fused experts."""
+    if isinstance(unfused, _UnfusedNonGatedExperts):
+        if override is not None:
+            up, down = override["up_proj"], override["down_proj"]
+        else:
+            up = torch.stack(
+                [
+                    _dequantized_weight_bias(e.up_proj)[0]
+                    for e in (unfused[i] for i in range(len(unfused)))
+                ]
+            )
+            down = torch.stack(
+                [
+                    _dequantized_weight_bias(e.down_proj)[0]
+                    for e in (unfused[i] for i in range(len(unfused)))
+                ]
+            )
+        return _NonGatedFusedExperts(up.contiguous(), down.contiguous(), unfused.act_fn)
     if override is not None:
         gate_up_3d = override["gate_up_proj"]
         down_3d = override["down_proj"]
@@ -627,7 +741,7 @@ def strip_moe_experts_from_quant_config(quant_config: dict) -> None:
         if not isinstance(layer_cfg, dict):
             continue
         for suffix in list(layer_cfg):
-            if suffix.startswith("mlp.experts."):
+            if suffix.startswith(("mlp.experts.", "mixer.experts.")):
                 del layer_cfg[suffix]
 
 
@@ -663,7 +777,7 @@ def unfuse_moe_experts(model: nn.Module, logger: logging.Logger) -> bool:
             "Unfused %s: %d experts -> %d nn.Linear layers",
             name,
             num,
-            num * 3,
+            num * (2 if isinstance(unfused, _UnfusedNonGatedExperts) else 3),
         )
 
     return True

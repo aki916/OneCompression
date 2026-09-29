@@ -70,7 +70,7 @@ class TestRtnFallbackResult:
         """
         out_features, in_features, groupsize = 16, 32, 8
         module = _linear(in_features=in_features, out_features=out_features)
-        quantizer = GPTQ(wbits=4, groupsize=groupsize, sym=True)
+        quantizer = GPTQ(wbits=4, groupsize=groupsize, sym=True, bitpack_on_quantize=False)
         result = _rtn_fallback_result(module, quantizer, "mlp.experts.0.down_proj")
 
         num_groups = in_features // groupsize
@@ -82,7 +82,27 @@ class TestRtnFallbackResult:
         module = _linear(in_features=32, out_features=16)
         quantizer = GPTQ(wbits=4, groupsize=-1, sym=True)
         result = _rtn_fallback_result(module, quantizer, "mlp.experts.0.down_proj")
-        assert result.dequantized_weight.shape == module.weight.data.shape
+        assert result.compute_dequantized_weight().shape == module.weight.data.shape
+        assert result.dequantized_weight is None
+
+    def test_packed_fallback_matches_unpacked_without_dense_copy(self):
+        module = _linear(in_features=32, out_features=16)
+        for sym in (True, False):
+            for groupsize in (-1, 8):
+                packed = _rtn_fallback_result(
+                    module, GPTQ(wbits=4, groupsize=groupsize, sym=sym), "experts.0.up_proj"
+                )
+                unpacked = _rtn_fallback_result(
+                    module,
+                    GPTQ(wbits=4, groupsize=groupsize, sym=sym, bitpack_on_quantize=False),
+                    "experts.0.up_proj",
+                )
+                assert packed.qweight_is_packed and packed.qzeros_is_packed
+                assert packed.dequantized_weight is None
+                assert packed.qweight.numel() < unpacked.qweight.numel()
+                torch.testing.assert_close(
+                    packed.compute_dequantized_weight(), unpacked.compute_dequantized_weight()
+                )
 
     def test_compute_dequantized_weight_roundtrip(self):
         """The packaged qweight/scales/qzeros must reconstruct a weight

@@ -16,6 +16,7 @@ input activations, so they can be captured once and reused.
 import copy
 import math
 from collections import OrderedDict
+from collections.abc import Iterator
 from logging import getLogger
 from typing import Optional
 
@@ -222,54 +223,60 @@ def _compute_per_module_hessians(
         the number of tokens routed to that module, or ``None`` if the module
         received no tokens during calibration.
     """
-    dest: dict[int, torch.Tensor] = {}
+    hessians: dict[nn.Module, torch.Tensor] = {}
+    nsamples = {module: 0 for module in modules}
 
-    def _make_hook(key):
-        def hook(_, inp, __):
-            dest[key] = inp[0] if isinstance(inp, tuple) else inp
+    def hook(module, inp, _):
+        # Accumulate immediately: retaining every expert's activations until
+        # the end of a forward is costly for hundreds of experts. Hooks can
+        # also fire more than once per module in chunked MoE implementations.
+        x = (inp[0] if isinstance(inp, tuple) else inp).reshape(-1, module.in_features)
+        count = x.size(0)
+        if not count:
+            return
+        if module not in hessians:
+            hessians[module] = torch.zeros(
+                (module.in_features, module.in_features), dtype=torch.float32, device=device
+            )
+        total = nsamples[module] + count
+        hessians[module].mul_(nsamples[module] / total)
+        x = x.float() * math.sqrt(2 / total)
+        hessians[module].addmm_(x.t(), x)
+        nsamples[module] = total
 
-        return hook
-
-    handlers = [m.register_forward_hook(_make_hook(i)) for i, m in enumerate(modules)]
-
-    hessians: dict[int, torch.Tensor] = {}
-    nsamples: dict[int, int] = {}
-    for i, m in enumerate(modules):
-        dim = m.in_features
-        hessians[i] = torch.zeros((dim, dim), device=device)
-        nsamples[i] = 0
-
-    N = inps.size(0)
+    handlers = [module.register_forward_hook(hook) for module in modules]
     pli = kwargs.get(_PER_LAYER_INPUTS_KEY)
-
-    for first in range(0, N, batch_size):
-        last = min(first + batch_size, N)
-        bs = last - first
-        batch_kwargs = expand_kwargs_batch(kwargs, bs)
-        batch_kwargs = prepare_block_kwargs(batch_kwargs, block, pli, first, bs, device)
-        _ = block(inps[first:last].to(device), **batch_kwargs)
-
-        for i, m in enumerate(modules):
-            if i not in dest:
-                continue
-            x = dest[i].view(-1, m.in_features).float()
-            tmp = x.size(0)
-            if tmp == 0:
-                continue
-            hessians[i] *= nsamples[i] / (nsamples[i] + tmp)
-            nsamples[i] += tmp
-            x_scaled = math.sqrt(2 / nsamples[i]) * x
-            hessians[i] += x_scaled.t() @ x_scaled
-
-        dest.clear()
-
-    for h in handlers:
-        h.remove()
+    try:
+        for first in range(0, inps.size(0), batch_size):
+            last = min(first + batch_size, inps.size(0))
+            bs = last - first
+            batch_kwargs = expand_kwargs_batch(kwargs, bs)
+            batch_kwargs = prepare_block_kwargs(batch_kwargs, block, pli, first, bs, device)
+            _ = block(inps[first:last].to(device), **batch_kwargs)
+    finally:
+        for handler in handlers:
+            handler.remove()
 
     return {
-        modules[i]: ((hessians[i], nsamples[i]) if nsamples[i] > 0 else None)
-        for i in range(len(modules))
+        module: ((hessians[module], nsamples[module]) if nsamples[module] else None)
+        for module in modules
     }
+
+
+def _group_expert_hessians(modules: list[nn.Module], max_bytes: int) -> Iterator[list[nn.Module]]:
+    """Bound simultaneous expert Hessians without dropping unrouted experts."""
+    group = []
+    group_bytes = 0
+    for module in modules:
+        module_bytes = module.in_features**2 * 4  # float32 Hessian
+        if group and group_bytes + module_bytes > max_bytes:
+            yield group
+            group = []
+            group_bytes = 0
+        group.append(module)
+        group_bytes += module_bytes
+    if group:
+        yield group
 
 
 def _resolve_gptq_for_rtn_fallback(quantizer: Quantizer, module: nn.Module) -> Optional[GPTQ]:
@@ -299,17 +306,30 @@ def _rtn_fallback_result(module: nn.Module, quantizer: Quantizer, name: str) -> 
     result_dict = run_rtn(module, wbits=wbits, groupsize=groupsize, sym=quantizer.sym)
 
     # RTN's raw scale/zero are (out_features, num_groups); GPTQResult
-    # expects (num_groups, out_features).
+    # expects (num_groups, out_features). Honor GPTQ's packing policy also
+    # for unused experts; keeping a dense copy per expert defeats streaming.
+    qweight = result_dict["quantized_weight"]
+    qzeros = result_dict["zero"].T
+    shape = tuple(qweight.shape)
+    packed = quantizer.bitpack_on_quantize
+    if packed:
+        from onecomp.quantizer.gptq.gptq_layer import pack_int_weights, pack_zeros
+
+        qweight = pack_int_weights(qweight.to(torch.int32), wbits).cpu()
+        qzeros = pack_zeros(qzeros.to(torch.float32).round().to(torch.int32) - 1, wbits).cpu()
     return GPTQResult(
-        dequantized_weight=result_dict["dequantized_weight"],
+        dequantized_weight=None if packed else result_dict["dequantized_weight"],
         wbits=wbits,
         groupsize=groupsize,
         actorder=False,
         sym=quantizer.sym,
-        qweight=result_dict["quantized_weight"],
-        scales=result_dict["scale"].T,
-        qzeros=result_dict["zero"].T,
+        qweight=qweight,
+        scales=result_dict["scale"] if groupsize == -1 else result_dict["scale"].T,
+        qzeros=qzeros,
         perm=None,
+        qweight_is_packed=packed,
+        qzeros_is_packed=packed,
+        qweight_original_shape=shape,
     )
 
 
@@ -341,10 +361,16 @@ def run_quantize_with_qep_arch(
 
     """
 
-    # TODO: Parameterize when necessary
-    batch_size = 16
+    batch_size = qep_config.batch_size
 
-    model = model_config.load_model(device_map="cpu")
+    load_for_quantization = getattr(model_config, "load_model_for_quantization", None)
+    model = (
+        load_for_quantization()
+        if load_for_quantization is not None
+        else model_config.load_model(device_map="cpu")
+    )
+    checkpoint = getattr(model, "_onecomp_checkpoint", None)
+    module_names = {module: name for name, module in model.named_modules()}
     tokenizer = model_config.load_tokenizer()
     device = qep_config.device
 
@@ -398,6 +424,8 @@ def run_quantize_with_qep_arch(
             logger.info("All target layers quantized -- skipping remaining blocks.")
             break
 
+        if checkpoint is not None:
+            checkpoint.load_module(block, module_names[block], device=device)
         block_q = block.to(device)
         block_f = copy.deepcopy(block_q)
 
@@ -542,68 +570,76 @@ def run_quantize_with_qep_arch(
                 "(weight correction disabled for expert layers)",
                 len(expert_modules_q),
             )
-            expert_hessians = _compute_per_module_hessians(
-                block_q,
-                expert_modules_q,
-                inps_q,
-                kwargs,
-                batch_size,
-                device,
-            )
-            for module_q in expert_modules_q:
-                name = quantizer.module_to_name[module_q]
-                entry = expert_hessians[module_q]
-                if entry is None:
-                    fallback_quantizer = _resolve_gptq_for_rtn_fallback(quantizer, module_q)
-                    if fallback_quantizer is not None:
-                        logger.warning(
-                            "Expert layer %s received no tokens during "
-                            "calibration; falling back to RTN so it stays "
-                            "quantized like its sibling experts",
-                            name,
-                        )
-                        quantizer.results[name] = _rtn_fallback_result(
-                            module_q, fallback_quantizer, name
-                        )
+            for expert_group in _group_expert_hessians(
+                expert_modules_q, qep_config.expert_hessian_max_bytes
+            ):
+                expert_hessians = _compute_per_module_hessians(
+                    block_q,
+                    expert_group,
+                    inps_q,
+                    kwargs,
+                    batch_size,
+                    device,
+                )
+                for module_q in expert_group:
+                    name = quantizer.module_to_name[module_q]
+                    entry = expert_hessians.pop(module_q)
+                    if entry is None:
+                        fallback_quantizer = _resolve_gptq_for_rtn_fallback(quantizer, module_q)
+                        if fallback_quantizer is not None:
+                            logger.warning(
+                                "Expert layer %s received no tokens during "
+                                "calibration; falling back to RTN so it stays "
+                                "quantized like its sibling experts",
+                                name,
+                            )
+                            quantizer.results[name] = _rtn_fallback_result(
+                                module_q, fallback_quantizer, name
+                            )
+                        else:
+                            logger.warning(
+                                "Expert layer %s received no tokens during calibration; skipping",
+                                name,
+                            )
+                            remaining_targets.discard(name)
+                            if progress is not None:
+                                progress.step_complete(f"{name}, skipped: no tokens")
+                            continue
                     else:
-                        logger.warning(
-                            "Expert layer %s received no tokens during calibration; skipping",
+                        H, nsamples_expert = entry
+                        logger.debug(
+                            "Processing layer: %s (no weight correction) =================================================",
                             name,
                         )
-                        remaining_targets.discard(name)
-                        if progress is not None:
-                            progress.step_complete(f"{name}, skipped: no tokens")
-                        continue
-                else:
-                    H, nsamples_expert = entry
-                    logger.debug(
-                        "Processing layer: %s (no weight correction) =================================================",
-                        name,
-                    )
-                    quantizer.quantize_with_qep(
-                        module_q,
-                        quant_input_activation=None,
-                        original_input_activation=None,
-                        percdamp=qep_config.percdamp,
-                        perccorr=qep_config.perccorr,
-                        hessian=H,
-                        delta_hatX=None,
-                        nsamples=nsamples_expert if quantizer.flag_nsamples else None,
-                    )
-                try:
-                    dtype = module_q.weight.data.dtype
-                    module_q.weight.data = (
-                        quantizer.results[name].compute_dequantized_weight().to(device).to(dtype)
-                    )
-                except (ValueError, NotImplementedError):
-                    logger.error(
-                        "Failed to compute dequantized weight for %s. "
-                        "Keeping original weights.",
-                        name,
-                    )
-                remaining_targets.discard(name)
-                if progress is not None:
-                    progress.step_complete(name)
+                        quantizer.quantize_with_qep(
+                            module_q,
+                            quant_input_activation=None,
+                            original_input_activation=None,
+                            percdamp=qep_config.percdamp,
+                            perccorr=qep_config.perccorr,
+                            hessian=H,
+                            delta_hatX=None,
+                            nsamples=nsamples_expert if quantizer.flag_nsamples else None,
+                        )
+                    try:
+                        dtype = module_q.weight.data.dtype
+                        module_q.weight.data = (
+                            quantizer.results[name]
+                            .compute_dequantized_weight()
+                            .to(device)
+                            .to(dtype)
+                        )
+                    except (ValueError, NotImplementedError):
+                        logger.error(
+                            "Failed to compute dequantized weight for %s. "
+                            "Keeping original weights.",
+                            name,
+                        )
+                    entry = None
+                    H = None
+                    remaining_targets.discard(name)
+                    if progress is not None:
+                        progress.step_complete(name)
 
         # forward input to the next block
         inps_q = forward_input(inps_q, block_q, kwargs, batch_size, device)
@@ -613,8 +649,15 @@ def run_quantize_with_qep_arch(
         mse = F.mse_loss(inps_q.float(), inps_f.float()).item()
         logger.info("Block %d MSE: %.6e", block_idx + 1, mse)
 
-        # free memory
-        block_q.cpu()
+        # Release the full-precision clone before materializing the next block.
+        # Group/name maps also contain references to its child modules.
+        if checkpoint is not None:
+            block_q.to_empty(device="meta")
+        else:
+            block_q.cpu()
+        del block_f, groups_f, name_to_module_f, regular_pairs
+        group_f = None
+        H = delta_hatX = layer_delta = None
         empty_cache(device)
 
     quantizer.execute_post_processing()

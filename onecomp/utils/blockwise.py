@@ -180,7 +180,10 @@ def get_blocks_and_inputs(
     # Detect models with heterogeneous layer types (e.g. Gemma4 with
     # full_attention / sliding_attention)
     blocks_parent = _find_blocks_parent(model, blocks)
-    layer_types = getattr(getattr(blocks_parent, "config", None), "layer_types", None)
+    config = getattr(blocks_parent, "config", None)
+    layer_types = getattr(config, "layer_types", None) or getattr(
+        config, "layers_block_type", None
+    )
     unique_layer_types = set(layer_types) if layer_types else set()
 
     is_gemma_like_mixed_attention = (
@@ -201,7 +204,10 @@ def get_blocks_and_inputs(
         and "linear_attention" in unique_layer_types
     )
 
-    has_mixed_types = is_gemma_like_mixed_attention or is_qwen35_like_hybrid
+    # Nemotron-H also has MoE layers, and older Transformers versions use
+    # "mamba" / "attention" instead of "linear_attention" / "full_attention".
+    is_nemotron_h = getattr(config, "model_type", None) == "nemotron_h"
+    has_mixed_types = is_gemma_like_mixed_attention or is_qwen35_like_hybrid or is_nemotron_h
 
     rotary_hook_handle = None
     pos_emb_map: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -231,28 +237,39 @@ def get_blocks_and_inputs(
     }
     logger.info("Capturing batch-independent kwargs with single sample.")
     try:
-        _ = model(inp_ids[:1], **single_kwargs)
-    except StopForward:
-        pass
-
-    if rotary_hook_handle is not None:
-        rotary_hook_handle.remove()
-
-    kwargs = dict(blocks[0].kwargs)  # shallow-copy before next loop overwrites
-    blocks[0].inp = None  # release single-sample activation (no longer needed)
-
-    # Now capture block inputs for all calibration samples.
-    block_inps = []
-    for inp in inp_ids.split(batch_size):
         try:
-            _ = model(inp, **model_kwargs)
+            _ = model(inp_ids[:1], **single_kwargs)
         except StopForward:
-            block_inps.append(blocks[0].inp.cpu())
+            pass
+        if rotary_hook_handle is not None:
+            rotary_hook_handle.remove()
+            rotary_hook_handle = None
 
-    inps = torch.cat(block_inps)
+        kwargs = dict(blocks[0].kwargs)
+        blocks[0].inp = None
 
-    # restore the original transformer block
-    blocks[0] = blocks[0].module
+        # Nemotron constructs masks before reaching the catcher: sample-wise
+        # attention masks and position IDs must follow the input-ID batch.
+        block_inps = []
+        for offset in range(0, len(inp_ids), batch_size):
+            batch_kwargs = {
+                k: (
+                    v[offset : offset + batch_size]
+                    if isinstance(v, torch.Tensor) and v.ndim > 1 and len(v) == len(inp_ids)
+                    else v
+                )
+                for k, v in model_kwargs.items()
+            }
+            try:
+                _ = model(inp_ids[offset : offset + batch_size], **batch_kwargs)
+            except StopForward:
+                block_inps.append(blocks[0].inp.cpu())
+        inps = torch.cat(block_inps)
+    finally:
+        if rotary_hook_handle is not None:
+            rotary_hook_handle.remove()
+        # Never leave the model wrapped if input preparation fails.
+        blocks[0] = blocks[0].module
 
     # Pre-compute per-layer inputs for some models (e.g. Gemma4).
     pli = _compute_per_layer_inputs(model, blocks, inp_ids, batch_size)
@@ -270,6 +287,7 @@ def get_blocks_and_inputs(
             blocks_parent,
             kwargs,
             unique_layer_types,
+            **({"attention_mask": single_kwargs.get("attention_mask")} if is_nemotron_h else {}),
         )
         if attn_mask_map is not None:
             kwargs[_ATTN_MASK_MAP_KEY] = attn_mask_map
@@ -301,7 +319,9 @@ def _create_linear_attention_mask(
     return attention_mask
 
 
-def _compute_per_type_attention_masks(blocks_parent, kwargs, unique_layer_types):
+def _compute_per_type_attention_masks(
+    blocks_parent, kwargs, unique_layer_types, *, attention_mask=None
+):
     """Compute attention masks for each layer type.
 
     Uses create_causal_mask / create_sliding_window_causal_mask
@@ -321,10 +341,20 @@ def _compute_per_type_attention_masks(blocks_parent, kwargs, unique_layer_types)
     device = position_ids.device
     dtype = next(blocks_parent.parameters()).dtype
     dummy_embeds = torch.zeros(1, seq_len, config.hidden_size, device=device, dtype=dtype)
-    attn_mask_1d = torch.ones(1, seq_len, device=device, dtype=torch.long)
+    attn_mask_1d = attention_mask
+    if attn_mask_1d is None:
+        attn_mask_1d = torch.ones(1, seq_len, device=device, dtype=torch.long)
 
     # tmp: Qwen3.5 has linear_attention layer type.
-    if unique_layer_types <= {"linear_attention", "full_attention"}:
+    is_nemotron_h = getattr(config, "model_type", None) == "nemotron_h"
+    if is_nemotron_h:
+        _mask_creators = {
+            "mamba": _create_linear_attention_mask,
+            "linear_attention": _create_linear_attention_mask,
+            "attention": create_causal_mask,
+            "full_attention": create_causal_mask,
+        }
+    elif unique_layer_types <= {"linear_attention", "full_attention"}:
         _mask_creators = {
             "linear_attention": _create_linear_attention_mask,
             "full_attention": create_causal_mask,
@@ -337,6 +367,9 @@ def _compute_per_type_attention_masks(blocks_parent, kwargs, unique_layer_types)
 
     mask_map = {}
     for lt in unique_layer_types:
+        if is_nemotron_h and lt in {"moe", "mlp"}:
+            mask_map[lt] = None
+            continue
         creator = _mask_creators.get(lt)
         if creator is not None:
             mask_map[lt] = creator(

@@ -50,7 +50,7 @@ def _get_num_experts(config):
     for cfg in candidates:
         if cfg is None:
             continue
-        for attr in ("num_experts", "num_local_experts"):
+        for attr in ("num_experts", "num_local_experts", "n_routed_experts"):
             value = getattr(cfg, attr, None)
             if value:
                 return value
@@ -370,6 +370,9 @@ class Runner:
             return
 
         keywords = ["router", "shared_expert_gate"]
+        if getattr(config, "model_type", None) == "nemotron_h":
+            # Nemotron uses a nongated expert MLP; mixer.gate is its router.
+            keywords.append("mixer.gate")
         target_quantizers = self.quantizers if self.quantizers is not None else [self.quantizer]
         for q in target_quantizers:
             existing = list(q.exclude_layer_keywords) if q.exclude_layer_keywords else []
@@ -1633,6 +1636,98 @@ class Runner:
                 )
                 logger.debug("Updated the model weights for layer: %s", name)
 
+    def _quant_config_for_model(self, model, quantizer, quant_config=None):
+        """Build save/load metadata from the layers actually quantized."""
+        if quant_config is None:
+            quant_config = quantizer.get_quant_config()
+        # Build modules_in_block_to_quantize from actually-quantized layer names.
+        quantized_names = sorted(quantizer.results.keys())
+        modules_in_block = list(quantized_names)
+        quant_config["modules_in_block_to_quantize"] = modules_in_block
+        quant_config["quantized_layer_names"] = modules_in_block
+        quant_config = quantizer.finalize_quant_config_for_save(
+            quant_config=quant_config,
+            quantized_layer_names=quantized_names,
+            num_hidden_layers=(
+                getattr(model.config, "num_hidden_layers", None)
+                or getattr(getattr(model.config, "text_config", None), "num_hidden_layers", None)
+            ),
+        )
+        quant_config["rotated"] = self.model_config.has_additional_data()
+        quant_config["fp32_had"] = getattr(self.model_config, "fp32_had", False)
+
+        return quant_config
+
+    def _keep_quantized_moe_experts(self, model):
+        """Nemotron saves retain the per-expert layout used by OneComp inference."""
+        return self.moe_quant_experts or getattr(model.config, "model_type", None) == "nemotron_h"
+
+    def _create_layerwise_quantized_model(self, quantizer, *, pack_weights):
+        """Materialize the packed model without loading a full BF16 source copy."""
+        from .export.modelopt import iter_quantized_modelopt_tensors
+        from .quantizer.gptq.gptq_layer import GPTQLinear
+
+        model = self.model_config.load_model_for_quantization()
+        reader = model._onecomp_checkpoint
+        try:
+            tensors = iter_quantized_modelopt_tensors(
+                model, reader, quantizer, pack_weights=pack_weights
+            )
+            # The iterator snapshots original module paths before replacement.
+            # Assigning one tensor at a time avoids a duplicate full state_dict.
+            quantized_names = set(quantizer.results)
+            replaced = set()
+            for name, tensor in tensors:
+                module_name, _, tensor_name = name.rpartition(".")
+                if module_name in quantized_names and module_name not in replaced:
+                    linear = model.get_submodule(module_name)
+                    bias = (
+                        reader.get_tensor(module_name + ".bias", dtype=linear.bias.dtype)
+                        if linear.bias is not None
+                        else None
+                    )
+                    layer = GPTQLinear.from_quantization_result(
+                        quantizer.results[module_name],
+                        bias=bias,
+                        device="cpu",
+                        pack_weights=pack_weights,
+                        use_gemlite=False,
+                    )
+                    model.set_submodule(module_name, layer)
+                    replaced.add(module_name)
+                module = model.get_submodule(module_name) if module_name else model
+                if tensor_name in module._parameters:
+                    old = module._parameters[tensor_name]
+                    module._parameters[tensor_name] = nn.Parameter(
+                        tensor, requires_grad=old.requires_grad
+                    )
+                elif tensor_name in module._buffers:
+                    module._buffers[tensor_name] = tensor
+                else:
+                    raise RuntimeError(f"Unexpected export tensor: {name}")
+            model.config.use_cache = self.model_config.load_config().use_cache
+            model.config.quantization_config = self._quant_config_for_model(model, quantizer)
+            if model.config.quantization_config["quant_method"] == "gptq":
+                model.config.quantization_config["quant_method"] = "mixed_gptq"
+            self._restore_generation_config(model)
+            model.eval()
+            return model, self.model_config.load_tokenizer()
+        finally:
+            reader.close()
+            del model._onecomp_checkpoint
+
+    def _restore_generation_config(self, model):
+        """Keep the source decoding defaults when constructing from config."""
+        from transformers import GenerationConfig
+
+        source = self._resolve_source_model_dir()
+        if source and (Path(source) / "generation_config.json").is_file():
+            model.generation_config = GenerationConfig.from_pretrained(
+                source, local_files_only=True
+            )
+        elif getattr(model, "generation_config", None) is not None:
+            model.generation_config.use_cache = model.config.use_cache
+
     def create_quantized_model(self, pack_weights: bool = True, quantizer=None, use_gemlite=None):
         """Create a quantized model from quantization results.
 
@@ -1706,6 +1801,12 @@ class Runner:
         # Delegate save config to quantizer (extensible via override)
         quant_config = quantizer.get_quant_config()
 
+        if (
+            isinstance(self.model_config, ModelConfig)
+            and self.model_config.uses_layerwise_loading()
+        ):
+            return self._create_layerwise_quantized_model(quantizer, pack_weights=pack_weights)
+
         # Load base model on CPU (GPU is not needed for saving)
         model = self.model_config.load_model(device_map="cpu")
         tokenizer = self.model_config.load_tokenizer()
@@ -1748,21 +1849,7 @@ class Runner:
                     fp32_had,
                 )
 
-        # Build modules_in_block_to_quantize from actually-quantized layer names.
-        quantized_names = sorted(quantizer.results.keys())
-        modules_in_block = list(quantized_names)
-        quant_config["modules_in_block_to_quantize"] = modules_in_block
-        quant_config["quantized_layer_names"] = modules_in_block
-        quant_config = quantizer.finalize_quant_config_for_save(
-            quant_config=quant_config,
-            quantized_layer_names=quantized_names,
-            num_hidden_layers=(
-                getattr(model.config, "num_hidden_layers", None)
-                or getattr(getattr(model.config, "text_config", None), "num_hidden_layers", None)
-            ),
-        )
-        quant_config["rotated"] = self.model_config.has_additional_data()
-        quant_config["fp32_had"] = fp32_had
+        quant_config = self._quant_config_for_model(model, quantizer, quant_config)
 
         # Rotated GPTQ models need the mixed_gptq plugin in vLLM so the
         # down_proj path can apply the online Hadamard transform.
@@ -1788,7 +1875,7 @@ class Runner:
             )
 
         if num_experts > 0:
-            if self.moe_quant_experts:
+            if self._keep_quantized_moe_experts(model):
                 # Keep experts as per-expert GPTQLinear tensors (4-bit) and leave
                 # them in the quant config so the mixed_gptq vLLM plugin serves
                 # them via GPTQMarlinMoEMethod.  No fuse/dequantize/strip.
@@ -2170,6 +2257,7 @@ class Runner:
             "generation_config.json",
             "model.safetensors.index.json",
             "pytorch_model.bin.index.json",
+            "hf_quant_config.json",
         }
     )
     _AUX_COPY_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
@@ -2207,6 +2295,8 @@ class Runner:
                 continue
             if name in self._AUX_COPY_EXCLUDE_FILES:
                 continue
+            if name.startswith("model-") and name.endswith(".json"):
+                continue  # source shard metadata describes the old weight format
             lower = name.lower()
             if lower.endswith(self._AUX_COPY_WEIGHT_SUFFIXES):
                 continue
@@ -2230,11 +2320,64 @@ class Runner:
             self.logger.info("Copied %s to save directory", name)
         return copied
 
+    def _save_layerwise_quantized_model(
+        self, save_directory, *, pack_weights, save_format, max_shard_size
+    ):
+        """Write a full safetensors checkpoint using bounded source-weight memory."""
+        from .export.modelopt import iter_quantized_modelopt_tensors, save_sharded_tensors
+
+        if save_format not in {"auto", "native"}:
+            raise ValueError("Layerwise Nemotron export supports save_format='auto' or 'native'.")
+        source = Path(self.model_config.get_model_id_or_path()).resolve()
+        destination = Path(save_directory).resolve()
+        if self.quantizer is None or not self.quantizer.results:
+            raise ValueError("Run quantization before saving the layerwise model.")
+
+        model = self.model_config.load_model_for_quantization()
+        reader = model._onecomp_checkpoint
+        try:
+            model.config.use_cache = self.model_config.load_config().use_cache
+            model.config.quantization_config = self._quant_config_for_model(model, self.quantizer)
+            if model.config.quantization_config["quant_method"] == "gptq":
+                model.config.quantization_config["quant_method"] = "mixed_gptq"
+            model.config.architectures = [type(model).__name__]
+            self._restore_generation_config(model)
+            tokenizer = self.model_config.load_tokenizer()
+            tensors = iter_quantized_modelopt_tensors(
+                model, reader, self.quantizer, pack_weights=pack_weights
+            )
+            self.logger.info("Writing Nemotron weights directly to safetensors shards")
+            save_sharded_tensors(tensors, destination, max_shard_size=max_shard_size)
+            model.config.save_pretrained(destination)
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.save_pretrained(destination)
+            tokenizer.save_pretrained(destination)
+            self._copy_auxiliary_files(str(source), str(destination))
+            # Old ModelOpt sidecars do not describe the newly written GPTQ tensors.
+            for name in ("hf_quant_config.json",):
+                (destination / name).unlink(missing_ok=True)
+            for path in destination.glob("model-*.json"):
+                path.unlink()
+            # The source has no post-process adapters. Prevent an older export's
+            # adapter from being silently attached when reusing its directory.
+            for path in (
+                destination / "adapter_model.safetensors",
+                destination / "adapter_config.json",
+                destination / LORA_ADAPTER_SUBDIR / "adapter_model.safetensors",
+                destination / LORA_ADAPTER_SUBDIR / "adapter_config.json",
+            ):
+                path.unlink(missing_ok=True)
+            self.logger.info("Quantized model saved to %s", destination)
+            return save_directory
+        finally:
+            reader.close()
+
     def save_quantized_model(
         self,
         save_directory: str,
         pack_weights: bool = True,
         save_format: str = "auto",
+        max_shard_size: str | int = "5GB",
     ):
         """Save the quantized model to the specified directory
 
@@ -2281,6 +2424,11 @@ class Runner:
                 **not** a generic "save any VLM for vLLM" option — passing it
                 for any other model (or any model whose original config isn't
                 composite) raises ``RuntimeError``. Defaults to ``"auto"``.
+            max_shard_size (str or int):
+                Maximum safetensors shard size (e.g. ``"5GB"``), or bytes.
+                A tensor larger than this is stored alone. For ModelOpt
+                Nemotron, weights are streamed without constructing the full
+                BF16 model, including when only some layers were quantized.
 
         Examples:
             Single quantizer mode:
@@ -2299,6 +2447,23 @@ class Runner:
         """
         logger = self.logger
         logger.info("Saving quantized model to %s", save_directory)
+
+        if (
+            isinstance(self.model_config, ModelConfig)
+            and self.model_config.uses_layerwise_loading()
+        ):
+            source = Path(self.model_config.get_model_id_or_path()).resolve()
+            if source == Path(save_directory).resolve():
+                raise ValueError(
+                    "Save to a different directory from the source ModelOpt checkpoint."
+                )
+            if self.quantized_model is None:
+                return self._save_layerwise_quantized_model(
+                    save_directory,
+                    pack_weights=pack_weights,
+                    save_format=save_format,
+                    max_shard_size=max_shard_size,
+                )
 
         if self.quantized_model is not None:
             logger.info("Using existing quantized model (post-process results preserved)")
@@ -2352,22 +2517,36 @@ class Runner:
             )
             if save_state_dict is not None:
                 model.save_pretrained(
-                    save_directory, state_dict=save_state_dict, **extra_save_kwargs
+                    save_directory,
+                    state_dict=save_state_dict,
+                    max_shard_size=max_shard_size,
+                    **extra_save_kwargs,
                 )
             else:
-                model.save_pretrained(save_directory, **extra_save_kwargs)
+                model.save_pretrained(
+                    save_directory, max_shard_size=max_shard_size, **extra_save_kwargs
+                )
         finally:
             model.config = orig_model_config_for_restore
 
         if num_experts > 0:
-            if self.moe_quant_experts:
+            if self._keep_quantized_moe_experts(model):
                 from .utils.unfuse_moe import verify_saved_moe_quant_checkpoint
 
-                n_experts = verify_saved_moe_quant_checkpoint(save_directory)
-                logger.info(
-                    "Saved checkpoint MoE (quant-experts): per-expert GPTQ layers=%d",
-                    n_experts,
-                )
+                # A partial Nemotron run may quantize only Mamba/attention,
+                # leaving every expert as an ordinary per-expert Linear.
+                qcfg = model.config.quantization_config
+                names = qcfg.get("quantized_layer_names", [])
+                has_quantized_experts = any(".experts." in name for name in names)
+                if (
+                    getattr(model.config, "model_type", None) != "nemotron_h"
+                    or has_quantized_experts
+                ):
+                    n_experts = verify_saved_moe_quant_checkpoint(save_directory)
+                    logger.info(
+                        "Saved checkpoint MoE (quant-experts): per-expert GPTQ layers=%d",
+                        n_experts,
+                    )
             else:
                 from .utils.unfuse_moe import verify_saved_moe_checkpoint
 
@@ -2830,7 +3009,7 @@ class Runner:
         # now-absent per-expert modules.  Idempotent: a no-op when the model is
         # already fused/stripped (create_quantized_model handles this on the normal
         # path); this is the safety net for the self.quantized_model path.
-        if _get_num_experts(model.config) > 0 and not self.moe_quant_experts:
+        if _get_num_experts(model.config) > 0 and not self._keep_quantized_moe_experts(model):
             from .utils.unfuse_moe import (
                 fuse_moe_experts,
                 strip_moe_experts_from_quant_config,

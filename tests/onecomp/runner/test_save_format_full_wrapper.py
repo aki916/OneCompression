@@ -404,7 +404,7 @@ class _FakeFullWrapperModel:
     def named_modules(self):
         return [(k.rsplit(".", 1)[0], None) for k in self._state_dict]
 
-    def save_pretrained(self, save_directory, state_dict=None):
+    def save_pretrained(self, save_directory, state_dict=None, max_shard_size="5GB"):
         self.save_calls.append(
             {
                 "state_dict": state_dict,

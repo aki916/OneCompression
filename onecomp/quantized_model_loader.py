@@ -10,8 +10,9 @@ import glob
 import json
 import os
 import re
+from contextlib import nullcontext
 from logging import getLogger
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from safetensors.torch import load_file
@@ -43,7 +44,7 @@ class QuantizedModelLoader:
         save_directory: str,
         *,
         torch_dtype: Optional[torch.dtype] = None,
-        device_map: Optional[str] = "auto",
+        device_map: Optional[Union[str, torch.device, Dict[str, Any]]] = "auto",
         trust_remote_code: bool = True,
         local_files_only: bool = True,
     ) -> Tuple[Any, Any]:
@@ -70,8 +71,9 @@ class QuantizedModelLoader:
 
         Args:
             save_directory: Path to the saved model directory.
-            torch_dtype: Model dtype (default: torch.float16).
-            device_map: Device placement (default: "auto").
+            torch_dtype: Model dtype (defaults to the saved config, then torch.float16).
+            device_map: Device placement (default: "auto"). Accepts a device
+                such as ``"cpu"`` / ``"cuda:0"`` or an Accelerate device map.
                 Set to ``None`` or ``""`` to leave the model on CPU.
             trust_remote_code: Passed to from_pretrained.
             local_files_only: Passed to from_pretrained.
@@ -130,7 +132,7 @@ class QuantizedModelLoader:
         # model.language_model.layers.* directly.
         state_dict = cls._remap_state_dict_keys(state_dict, model)
 
-        # Replace quantized layers with empty modules and align quantized
+        # Replace Linear layers with quantized modules and align quantized
         # tensor keys with the actual module names in the model built from
         # config.  This is required when the saved checkpoint and the
         # from_config model use different wrapper prefixes, e.g.
@@ -141,7 +143,21 @@ class QuantizedModelLoader:
         # is intentional because some wrapper-only components may be absent, but
         # critical language-model and quantized-buffer mismatches must fail fast.
         incompat = model.load_state_dict(state_dict, strict=False, assign=True)
+        del state_dict
         cls._retie_lm_head_if_needed(model, incompat)
+        if getattr(model.config, "model_type", None) == "nemotron_h":
+            # Every Mamba state parameter, routing bias and embedding matters
+            # for inference. None may silently retain initialization values.
+            expected_missing = (
+                {"lm_head.weight"} if cls._should_retie_word_embeddings(model.config) else set()
+            )
+            missing = set(incompat.missing_keys) - expected_missing
+            if missing or incompat.unexpected_keys:
+                raise RuntimeError(
+                    "Incomplete Nemotron-H checkpoint: "
+                    f"missing={sorted(missing)[:80]}, "
+                    f"unexpected={incompat.unexpected_keys[:80]}"
+                )
 
         # Safety net: ``load_state_dict(..., assign=True)`` only replaces
         # parameters whose key in the checkpoint exactly matches the model's
@@ -203,15 +219,16 @@ class QuantizedModelLoader:
         # so LoRA wrappers are included in the device map traversal below.
         cls._apply_lora_adapters_from_sidecar(model, save_directory)
 
-        # Device placement
-        if device_map:
-            try:
-                from accelerate import dispatch_model, infer_auto_device_map
+        meta_names = [
+            name
+            for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
+            if tensor.is_meta
+        ]
+        if meta_names:
+            raise RuntimeError(f"Unmaterialized tensors after model loading: {meta_names[:80]}")
 
-                device_map_resolved = infer_auto_device_map(model)
-                model = dispatch_model(model, device_map=device_map_resolved)
-            except ImportError:
-                model = model.to(get_default_device())
+        model = cls._place_model(model, device_map)
+        model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(
             save_directory,
@@ -224,6 +241,38 @@ class QuantizedModelLoader:
         model.config.quantization_config = quant_config
 
         return model, tokenizer
+
+    @staticmethod
+    def _place_model(model, device_map):
+        """Respect explicit placements and keep hybrid decoder blocks intact."""
+        if device_map is None or device_map == "":
+            return model
+        if isinstance(device_map, torch.device) or (
+            isinstance(device_map, str)
+            and device_map not in {"auto", "balanced", "balanced_low_0", "sequential"}
+        ):
+            return model.to(device_map)
+        try:
+            from accelerate import dispatch_model, infer_auto_device_map
+            from accelerate.utils import get_balanced_memory
+        except ImportError:
+            if isinstance(device_map, dict):
+                raise ImportError("An explicit module device_map requires accelerate.") from None
+            return model.to(get_default_device())
+
+        if isinstance(device_map, dict):
+            resolved = device_map
+        else:
+            no_split = getattr(model, "_no_split_modules", None)
+            kwargs = {"no_split_module_classes": no_split}
+            if device_map in {"balanced", "balanced_low_0"}:
+                kwargs["max_memory"] = get_balanced_memory(
+                    model,
+                    no_split_module_classes=no_split,
+                    low_zero=device_map == "balanced_low_0",
+                )
+            resolved = infer_auto_device_map(model, **kwargs)
+        return dispatch_model(model, device_map=resolved)
 
     @classmethod
     def load_quantized_model_pt(
@@ -565,22 +614,37 @@ class QuantizedModelLoader:
             torch_dtype = cls._resolve_dtype_from_config(clean_config)
         dtype = torch_dtype if torch_dtype is not None else torch.float16
         config_cls = CONFIG_MAPPING[model_type]
+        # Transformers 5 serializes non-finite values (e.g. Mamba's time step
+        # upper limit) as {"__float__": "Infinity"}. from_dict does not run
+        # the JSON decoder that from_pretrained normally applies.
+        decode_special_floats = getattr(config_cls, "_decode_special_floats", None)
+        if decode_special_floats is not None:
+            clean_config = decode_special_floats(clean_config)
         model_config = config_cls.from_dict(clean_config)
-        try:
-            return AutoModelForCausalLM.from_config(model_config, dtype=dtype)
-        except (ValueError, KeyError):
-            from transformers import AutoModelForImageTextToText
+        # The Nemotron Ultra BF16 skeleton would otherwise allocate over 1 TB
+        # before its Linear layers can be replaced with packed GPTQ buffers.
+        # Keep nonpersistent buffers on CPU: they are not in the checkpoint
+        # and must retain the values generated by the model constructor.
+        context = nullcontext()
+        if model_type == "nemotron_h":
+            from accelerate import init_empty_weights
 
-            return AutoModelForImageTextToText.from_config(model_config, dtype=dtype)
+            context = init_empty_weights(include_buffers=False)
+        with context:
+            try:
+                return AutoModelForCausalLM.from_config(model_config, dtype=dtype)
+            except (ValueError, KeyError):
+                from transformers import AutoModelForImageTextToText
+
+                return AutoModelForImageTextToText.from_config(model_config, dtype=dtype)
 
     @staticmethod
     def _set_module_by_name(
         model: torch.nn.Module, full_name: str, module: torch.nn.Module
     ) -> None:
         """Replace the submodule at *full_name* (dotted path) with *module*."""
-        name_to_module = dict(model.named_modules())
         parent_name, _, child_name = full_name.rpartition(".")
-        parent = name_to_module.get(parent_name, model)
+        parent = model.get_submodule(parent_name) if parent_name else model
         setattr(parent, child_name, module)
 
     @classmethod
@@ -609,6 +673,7 @@ class QuantizedModelLoader:
             so strict=False loading can still proceed.
         """
         model_keys = set(dict(model.named_parameters())) | set(dict(model.named_buffers()))
+        model_module_names = set(dict(model.named_modules()))
         if not any(
             cls._apply_known_state_dict_key_rewrites(key) is not None for key in state_dict
         ) and all(key in model_keys for key in state_dict):
@@ -617,7 +682,10 @@ class QuantizedModelLoader:
         remapped: dict = {}
         rewrite_count = 0
         for ckpt_key, tensor in state_dict.items():
-            if ckpt_key in model_keys:
+            if ckpt_key in model_keys or ckpt_key.rpartition(".")[0] in model_module_names:
+                # Packed buffers do not exist until Linear replacement, but
+                # an exact module path already establishes their destination.
+                # Avoid a full suffix scan for every expert's GPTQ buffer.
                 remapped[ckpt_key] = tensor
                 continue
 
@@ -692,16 +760,42 @@ class QuantizedModelLoader:
 
     @staticmethod
     def _load_state_dict_from_dir(directory: str) -> dict:
-        """Load all tensors from *.safetensors in *directory*.
+        """Load model tensors, following the shard index when present.
 
         Raises:
             FileNotFoundError: If no *.safetensors files are found in *directory*.
         """
         state_dict: dict = {}
-        safetensors_files = sorted(glob.glob(os.path.join(directory, "*.safetensors")))
-        if safetensors_files:
-            for f in safetensors_files:
-                state_dict.update(load_file(f))
+        index_path = os.path.join(directory, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path, encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            safetensors_files = [
+                os.path.join(directory, name) for name in set(weight_map.values())
+            ]
+        else:
+            weight_map = None
+            safetensors_files = [
+                name
+                for name in glob.glob(os.path.join(directory, "*.safetensors"))
+                if os.path.basename(name) != "adapter_model.safetensors"
+            ]
+        for filename in sorted(safetensors_files):
+            shard = load_file(filename)
+            if weight_map is not None:
+                expected = {
+                    key for key, name in weight_map.items() if name == os.path.basename(filename)
+                }
+                missing = expected - shard.keys()
+                if missing:
+                    raise RuntimeError(
+                        f"Missing indexed tensors in {filename}: {sorted(missing)[:20]}"
+                    )
+                shard = {key: shard[key] for key in expected}
+            duplicates = state_dict.keys() & shard.keys()
+            if duplicates:
+                raise RuntimeError(f"Duplicate checkpoint tensors: {sorted(duplicates)[:20]}")
+            state_dict.update(shard)
         if not state_dict:
             raise FileNotFoundError(
                 f"No model weights found in {directory}. " "Expected *.safetensors files."
@@ -946,7 +1040,7 @@ class QuantizedModelLoader:
 
     @staticmethod
     def _replace_quantized_layers(model, state_dict: dict, quant_config: dict) -> dict:
-        """Replace ``nn.Linear`` with empty quantized modules.
+        """Replace ``nn.Linear`` with checkpoint-backed quantized modules.
 
         In addition, materialize quantized tensor keys from checkpoint source
         prefixes to actual model module prefixes. This avoids GPTQ/DBF/MDBF/
@@ -1061,7 +1155,9 @@ class QuantizedModelLoader:
                         "actorder",
                         default=False,
                     ),
-                    empty=True,
+                    # Reference checkpoint tensors directly rather than
+                    # allocating a second model-sized set of zero buffers.
+                    empty=False,
                     checkpoint_format=get_quant_param(
                         quant_config,
                         "checkpoint_format",
@@ -1243,7 +1339,7 @@ class QuantizedModelLoader:
                     bad.append((name, attr, "empty"))
                     continue
 
-                if not torch.isfinite(tensor.detach().float()).all().item():
+                if tensor.is_floating_point() and not torch.isfinite(tensor.detach()).all().item():
                     bad.append((name, attr, "non_finite"))
                     continue
 

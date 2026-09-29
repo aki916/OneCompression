@@ -138,3 +138,12 @@ def test_moe_model_does_not_alias_keyword_list_across_quantizers():
     assert q1.exclude_layer_keywords is not q2.exclude_layer_keywords
     q1.exclude_layer_keywords.append("extra")
     assert q2.exclude_layer_keywords == ["router", "shared_expert_gate"]
+
+
+def test_nemotron_n_routed_experts_excludes_mixer_gate():
+    quantizer = _FakeQuantizer()
+    runner = _make_runner(
+        SimpleNamespace(model_type="nemotron_h", n_routed_experts=512), quantizer=quantizer
+    )
+    runner._exclude_moe_router_if_needed()
+    assert quantizer.exclude_layer_keywords == ["router", "shared_expert_gate", "mixer.gate"]
