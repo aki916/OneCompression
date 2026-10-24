@@ -1,5 +1,22 @@
 # Change log
 
+## [Unreleased]
+
+### New Features
+
+- **Runtime reasoning compression (experimental)**: new `onecomp.reasoning` and
+  `onecomp.runtime` packages shorten the thinking phase of reasoning models
+  (e.g. Qwen3) at inference time without training. Policies: fixed and
+  prompt-based budgets, ThinkBrake, DEER, answer stability, an ASAG reference
+  implementation and an experimental progressive cascade. A Transformers
+  reference backend supports all policies (answer probes branch the KV cache and
+  restore it exactly); a vLLM 0.21 logits processor supports the budget and
+  ThinkBrake policies per request. Compression is disabled by default.
+  The `onecomp-reasoning` CLI prepares pinned datasets, runs paired experiments,
+  labels safe stopping points offline, and analyzes/calibrates runs. See the
+  [reasoning compression guide](docs/user-guide/reasoning-compression.md) and the
+  [example](example/example_reasoning_compression.py).
+
 ## [v1.4.0] 2026-10-09
 
 ### Breaking Changes
