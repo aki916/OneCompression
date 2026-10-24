@@ -1,0 +1,21 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "backend": "transformers",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "quantization": "none",
+  "dataset_path": "experiments/reasoning_compression/data/math500.jsonl",
+  "split": "development",
+  "limit": 12,
+  "seed": 0,
+  "max_new_tokens": 16000,
+  "warmup_requests": 1,
+  "policies": [
+    {"policy": "none"},
+    {"policy": "fixed", "budget": 512},
+    {"policy": "fixed", "budget": 2048},
+    {"policy": "prompt_budget"},
+    {"policy": "thinkbrake", "threshold": 0.1, "temperature": 0.6, "boundary": "sentence"},
+    {"policy": "deer", "confidence_threshold": 0.95, "boundary": "transition"}
+  ]
+}

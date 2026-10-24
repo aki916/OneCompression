@@ -1,0 +1,26 @@
+{
+  "model": "artifacts/qwen3-8b-gptq4-g128",
+  "backend": "vllm",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "quantization": "mixed_gptq",
+  "dataset_path": "experiments/reasoning_compression/data/math500.jsonl",
+  "split": "calibration",
+  "limit": 100,
+  "seed": 0,
+  "max_new_tokens": 16000,
+  "max_model_len": 32768,
+  "warmup_requests": 2,
+  "policies": [
+    {"policy": "none"},
+    {"policy": "fixed", "budget": 256},
+    {"policy": "fixed", "budget": 512},
+    {"policy": "fixed", "budget": 1024},
+    {"policy": "fixed", "budget": 2048},
+    {"policy": "fixed", "budget": 4096},
+    {"policy": "fixed", "budget": 8192},
+    {"policy": "thinkbrake", "threshold": 0.05, "temperature": 0.6},
+    {"policy": "thinkbrake", "threshold": 0.1, "temperature": 0.6},
+    {"policy": "thinkbrake", "threshold": 0.3, "temperature": 0.6}
+  ]
+}

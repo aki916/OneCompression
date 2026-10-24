@@ -1,0 +1,5 @@
+data/
+results/*/
+!results/.gitkeep
+logs/*.log
+__pycache__/

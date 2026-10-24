@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "backend": "vllm",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "quantization": "none",
+  "dataset_path": "experiments/reasoning_compression/data/math500.jsonl",
+  "split": "development",
+  "limit": 30,
+  "seed": 0,
+  "max_new_tokens": 16000,
+  "max_model_len": 20000,
+  "gpu_memory_utilization": 0.9,
+  "warmup_requests": 2,
+  "policies": [
+    {"policy": "none"},
+    {"policy": "fixed", "budget": 2048},
+    {"policy": "prompt_budget"},
+    {"policy": "thinkbrake", "threshold": 0.1, "temperature": 0.6, "boundary": "sentence"},
+    {"policy": "thinkbrake", "threshold": 0.1, "temperature": 1.0, "boundary": "sentence"}
+  ]
+}
