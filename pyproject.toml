@@ -46,6 +46,7 @@ Changelog = "https://github.com/FujitsuResearch/OneCompression/blob/main/CHANGEL
 [project.scripts]
 onecomp = "onecomp.cli:main"
 onecomp-eval = "onecomp.eval.run_evaluate:main"
+onecomp-reasoning = "onecomp.reasoning.cli:main"
 onecomp-gguf = "onecomp.cpu.cli:main"
 
 [project.optional-dependencies]
