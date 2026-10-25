@@ -1,8 +1,5 @@
 # Runtime reasoning compression design
 
-Design recorded before implementation, 2026-10-24 (JST), against commit
-`4c9c8cf56ec322ae0ed7b84353839d10f33ecb04`, OneComp 1.4.0.
-
 ## Existing architecture and extension point
 
 `ModelConfig` loads Transformers models/tokenizers; `QuantizedModelLoader` reconstructs
@@ -101,7 +98,5 @@ multiple-choice grading is supported, with algebraic equivalence limitations mad
 explicit. Reference GPU timings and vLLM serving timings must not be conflated.
 
 CPU synthetic/unit experiments validate mechanics and accounting but cannot answer
-model-quality or GPU speedup questions; those come only from real-model runs (see
-[results](results.md)). Paper reproduction, full benchmark sweeps, optimized ASAG
-attention statistics and BF16/4-bit transfer remain empirical gates. No simulated
-score is to be labeled a Qwen3 or published-benchmark result.
+model-quality or GPU speedup questions; those come only from real-model runs. No
+simulated score is to be labeled a Qwen3 or published-benchmark result.

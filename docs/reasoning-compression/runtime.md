@@ -1,9 +1,8 @@
 # Runtime contract and vLLM instrumentation investigation
 
-Inspected locally on 2026-10-24: Transformers 5.14.1, torch 2.11.0+cu130,
-vLLM 0.21.0. CPU integration tests exercise actual tiny Qwen3 forwards and the
-installed vLLM batch-update types; they do not establish GPU serving performance.
-Qwen3-8B GPU measurements are reported in [results](results.md).
+Inspected against Transformers 5.14.1, torch 2.11.0+cu130 and vLLM 0.21.0. CPU
+integration tests exercise actual tiny Qwen3 forwards and the installed vLLM
+batch-update types; they do not establish GPU serving performance.
 
 ## Transformers reference
 

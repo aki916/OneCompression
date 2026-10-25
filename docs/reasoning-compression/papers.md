@@ -1,8 +1,7 @@
 # Reasoning-compression sources and reproduction contract
 
-Sources inspected on 2026-10-24. A tested equation or CPU implementation is not a
-reproduction of a published model-quality or GPU-performance result. See
-[design](design.md) and [results](results.md) for what has been measured.
+A tested equation or CPU implementation is not a reproduction of a published
+model-quality or GPU-performance result. See [design](design.md) for the contracts.
 
 ## ThinkBrake
 

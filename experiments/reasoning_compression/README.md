@@ -4,8 +4,8 @@ Use the repository virtual environment. Runtime compression is disabled by defau
 these commands are separate from weight quantization. Read the
 [user guide](../../docs/user-guide/reasoning-compression.md),
 [design](../../docs/reasoning-compression/design.md),
-[paper deviations](../../docs/reasoning-compression/papers.md), and
-[current results](../../docs/reasoning-compression/results.md) before interpreting results.
+and [paper deviations](../../docs/reasoning-compression/papers.md) before
+interpreting results.
 
 ## CPU validation
 
@@ -139,7 +139,7 @@ source identities and paired examples. Set `allow_quantization_transfer: true`
 only for the explicit BF16-selected configuration applied to a quantized model.
 Quantization can change confidence and latency; never multiply token savings by a
 weight-compression speedup. Reference packed-weight timing is distinct from vLLM
-Marlin serving timing. No quantized benchmark has been measured in this environment.
+Marlin serving timing.
 
 ## Paper and deployment limits
 
