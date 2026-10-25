@@ -121,6 +121,22 @@ class CoreTests(unittest.TestCase):
             "stop",
         )
 
+    def test_first_attention_boundary_has_no_relative_entropy(self):
+        s = RequestState("a", ReasoningFormat((10,), (20,)))
+        c = ReasoningCompressionController(ReasoningConfig(policy="asag_reference"))
+        c.decide(s, {"confidence": 0.4, "attention_entropy": 10})
+        self.assertIsNone(s.signals[-1]["relative_entropy"])
+        self.assertTrue(s.signals[-1]["first_attention_boundary"])
+
+    def test_preamble_tokens_are_neither_reasoning_nor_answer(self):
+        s = RequestState("a", ReasoningFormat((10,), (20,), starts_in_reasoning=False))
+        for token in (1, 1, 10, 2, 20, 3):
+            s.append(token)
+        self.assertEqual(
+            s.token_kinds, ["preamble", "preamble", "marker", "reasoning", "marker", "answer"]
+        )
+        self.assertEqual((s.reasoning_tokens, s.answer_tokens, s.marker_tokens), (1, 1, 2))
+
     def test_repeated_boundary_does_not_accumulate_evidence(self):
         s = RequestState("a", ReasoningFormat((10,), (20,)))
         c = ReasoningCompressionController(ReasoningConfig(policy="stability", stability_window=2))

@@ -397,14 +397,12 @@ class TransformersReasoningAdapter:
         controller = ReasoningCompressionController(config) if config is not None else None
         policy = controller.policy if controller is not None else None
         observe = controller is not None and (config.policy != "none" or collect_boundaries)
-        uses_logits = observe and (policy.uses_logits or collect_boundaries)
-        if uses_logits and len(reasoning_format.end_token_ids) != 1:
+        singleton_end = len(reasoning_format.end_token_ids) == 1
+        if observe and (policy.requires_logits or collect_boundaries) and not singleton_end:
             raise ValueError("Adaptive output-logit signals require a singleton end marker")
-        if (
-            policy is not None
-            and policy.uses_probe
-            and policy.probe_options()["collect_attention"]
-        ):
+        # Recording-only margins are skipped when the end marker spans several tokens.
+        uses_logits = observe and (policy.uses_logits or collect_boundaries) and singleton_end
+        if policy is not None and policy.requires_attention:
             self._require_eager()
         state = RequestState(request_id, reasoning_format)
         if initial_phase is not None:

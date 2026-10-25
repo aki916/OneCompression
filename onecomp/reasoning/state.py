@@ -77,11 +77,11 @@ class RequestState:
     def append(self, token_id: int, text: str = ""):
         self.generated_token_ids.append(int(token_id))
         self.last_text = text
-        kind = "reasoning" if self.phase == "reasoning" else "answer"
+        kind = self.phase
         self.token_kinds.append(kind)
         if kind == "reasoning":
             self.reasoning_tokens += 1
-        else:
+        elif kind == "answer":
             self.answer_tokens += 1
         marker = None
         # Some templates include the opening marker, others generate it.

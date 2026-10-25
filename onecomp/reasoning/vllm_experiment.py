@@ -31,9 +31,7 @@ def run(config, output, samples, policies, *, selection=None):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; vLLM GPU benchmark cannot run")
     unsupported = [
-        p.policy
-        for p in policies
-        if p.policy not in {"none", "fixed", "prompt_budget", "thinkbrake"}
+        p.policy for p in policies if p.policy not in VLLMReasoningAdapter.supported_policies
     ]
     if unsupported:
         raise ValueError(f"vLLM logits hook cannot run probe/attention policies: {unsupported}")

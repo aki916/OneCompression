@@ -29,6 +29,7 @@ import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from onecomp.reasoning import ReasoningConfig, ReasoningFormat
+from onecomp.reasoning.data import write_json, write_jsonl
 from onecomp.reasoning.experiment import environment_metadata
 from onecomp.reasoning.metrics import entropy_hypothesis
 from onecomp.reasoning.metrics.report import analyze_runs
@@ -132,18 +133,6 @@ class ScriptedHeadQwen3(torch.nn.Module):
             logits[:, -1, 2] = logits[:, -1, next_token] - margin
         output.logits = logits
         return output
-
-
-def write_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-
-
-def write_jsonl(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row, allow_nan=False) + "\n" for row in rows), encoding="utf-8"
-    )
 
 
 def execute(destination, examples, *, profiled=False):

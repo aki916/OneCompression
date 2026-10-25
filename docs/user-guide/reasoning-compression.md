@@ -91,7 +91,9 @@ params = SamplingParams(
 Requests without the metadata are untouched, and each request in a batch keeps
 its own state. Only `none`, `fixed`, `prompt_budget` and `thinkbrake` are
 supported; probe and attention policies raise `NotImplementedError`. The
-processor is validated against vLLM 0.21.x and rejects speculative decoding and `n > 1`.
+processor supports vLLM 0.21.x only (other versions raise `RuntimeError` at
+construction, although the `vllm` extra allows `>=0.10,<0.22`) and rejects
+speculative decoding and `n > 1`.
 
 ## Configuration
 

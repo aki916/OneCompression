@@ -39,7 +39,7 @@ QUESTION = (
     "and 2n is a perfect cube?"
 )
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16, device_map="cuda:0")
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16, device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 adapter = TransformersReasoningAdapter(model, tokenizer)
 

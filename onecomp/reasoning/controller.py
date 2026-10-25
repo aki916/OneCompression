@@ -80,7 +80,9 @@ class ReasoningCompressionController:
                 state.first_entropy = entropy
             # Derive the ratio from request-local history; caller-provided values
             # must not silently use a different denominator or previous boundary.
-            values["relative_entropy"] = relative_entropy_change(entropy, state.first_entropy)
+            values["relative_entropy"] = (
+                None if first else relative_entropy_change(entropy, state.first_entropy)
+            )
         decision = self.policy.decide(state, values)
         state.last_decision_boundary = boundary
         if not state.boundaries or state.boundaries[-1] != boundary:

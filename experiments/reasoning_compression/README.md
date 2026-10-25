@@ -1,6 +1,6 @@
 # Reasoning compression experiments
 
-Use the repository virtual environment. Runtime compression is disabled by default;
+Install OneComp (`pip install -e .`). Runtime compression is disabled by default;
 these commands are separate from weight quantization. Read the
 [user guide](../../docs/user-guide/reasoning-compression.md),
 [design](../../docs/reasoning-compression/design.md),
@@ -10,12 +10,14 @@ interpreting results.
 ## CPU validation
 
 ```bash
-.venv/bin/python -m pytest tests/onecomp/reasoning tests/onecomp/runtime
-.venv/bin/python -m onecomp.reasoning environment
-.venv/bin/python experiments/reasoning_compression/smoke.py --help
-MPLCONFIGDIR=/tmp/onecomp-matplotlib .venv/bin/python \
-  experiments/reasoning_compression/plot_smoke.py experiments/reasoning_compression/cpu_smoke
+python -m pytest tests/onecomp/reasoning tests/onecomp/runtime
+onecomp-reasoning environment
+python experiments/reasoning_compression/smoke.py --help
+python -m onecomp.analyzer.reasoning.plot_smoke experiments/reasoning_compression/cpu_smoke
 ```
+
+Result analysis and plotting tools live in `onecomp.analyzer.reasoning` and need
+the `visualize` extra (`pip install -e ".[visualize]"`).
 
 The CPU smoke uses a tiny random Qwen3 backbone with scripted logits and artificial
 labels. It validates mechanics and measures this fixture's execution cost. It is
@@ -26,9 +28,8 @@ not a Qwen3-8B quality, literature reproduction, or GPU-performance benchmark.
 Freeze an immutable Hugging Face dataset commit SHA; no silent revision defaults:
 
 ```bash
-.venv/bin/python -m onecomp.reasoning prepare-data math500 \
+onecomp-reasoning prepare-data math500 \
   --revision DATASET_COMMIT_SHA \
-  --cache-dir /tmp/onecomp-datasets \
   --output experiments/reasoning_compression/data/math500.jsonl
 ```
 
@@ -54,10 +55,10 @@ errors or supply a validated symbolic grader before claiming comparable MATH sco
 Start with the 12-example config; inspect JSONL before larger sweeps:
 
 ```bash
-.venv/bin/python -m onecomp.reasoning run \
+onecomp-reasoning run \
   --config experiments/reasoning_compression/configs/qwen3_bf16_smoke.json \
   --output experiments/reasoning_compression/results/qwen3-smoke
-.venv/bin/python -m onecomp.reasoning oracle \
+onecomp-reasoning oracle \
   --config experiments/reasoning_compression/configs/qwen3_oracle.json \
   --output experiments/reasoning_compression/results/qwen3-oracle
 ```
@@ -68,6 +69,11 @@ selection. All methods in a reference sweep share one model/attention implementa
 Full eager probe attention can use quadratic memory. Oracle trials are separate
 independent re-prefills, include failed stops, and log replay costs. The default
 oracle candidate cap makes the search censored; remove it only when compute permits.
+
+`qwen3_bf16_gpu_trial.json` (Transformers, eager; includes DEER and ASAG) and
+`qwen3_vllm_gpu_trial.json` (vLLM; budget and ThinkBrake policies only) run a
+30-example MATH-500 development trial with a 16k-token generation limit. Run them
+with `onecomp-reasoning run --config ... --output ...`.
 
 Use `qwen3_vllm_calibration.json` for cheap policies on the inspected vLLM 0.21 API.
 The continuous-batch logits processor supports mixed policies, slot swaps and
@@ -88,11 +94,11 @@ vary order externally to assess timing variance; a single run is exploratory.
 ## Offline selection and held-out evaluation
 
 ```bash
-.venv/bin/python -m onecomp.reasoning calibrate \
+onecomp-reasoning calibrate \
   experiments/reasoning_compression/results/calibration/0* \
   --max-accuracy-drop 0.5 \
   --output experiments/reasoning_compression/results/selected.json
-.venv/bin/python -m onecomp.reasoning run \
+onecomp-reasoning run \
   --config /path/to/held-out-evaluation-config.json \
   --reasoning-compression auto \
   --selected-config experiments/reasoning_compression/results/selected.json \
@@ -117,7 +123,7 @@ the explicit export recipe, using the quantizer already exercised by the
 [Qwen3 GPTQ benchmark](../../benchmark/qwen3-8b-gptq/README.md):
 
 ```bash
-.venv/bin/python experiments/reasoning_compression/quantize_gptq4.py \
+python experiments/reasoning_compression/quantize_gptq4.py \
   --model /path/to/pinned/Qwen3-8B-snapshot \
   --source-revision MODEL_COMMIT_SHA \
   --output artifacts/qwen3-8b-gptq4-g128
@@ -144,9 +150,10 @@ Marlin serving timing.
 ## Paper and deployment limits
 
 ThinkBrake is a greedy logit-gap variant with documented sentence heuristics; DEER
-uses the paper's geometric confidence but isolated re-prefill probes. Stability is
+uses the paper's geometric confidence with answer probes that branch the KV cache
+and restore it afterwards (`probe_prefix_reuse: false` re-prefills instead). Stability is
 a sequential signal inspired by Dynasor, not its multi-path Certaindex scheduler.
 ASAG is explicitly `asag_reference`: first-probe entropy baseline, last-four-layer
 normalized entropy, probability mixing, and bounded jumps, with unresolved paper
-ambiguities recorded. A validated qualitative literature trend remains a gate.
+ambiguities recorded.
 No production claim follows from unit tests or synthetic smoke timings.

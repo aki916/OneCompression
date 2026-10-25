@@ -1,5 +1,9 @@
 data/
-results/*/
+results/*
 !results/.gitkeep
-logs/*.log
+logs/
+cpu_smoke/
+cpu_profile/
+intervention_cpu_smoke/
+plots/
 __pycache__/

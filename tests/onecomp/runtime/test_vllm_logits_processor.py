@@ -18,7 +18,10 @@ FORMAT = ReasoningFormat((2,), (3,))
 
 @pytest.fixture
 def processor():
-    VLLMReasoningAdapter.check_version()
+    try:
+        VLLMReasoningAdapter.check_version()
+    except RuntimeError as error:
+        pytest.skip(str(error))
     return ReasoningLogitsProcessor(SimpleNamespace(speculative_config=None), "cpu", False)
 
 

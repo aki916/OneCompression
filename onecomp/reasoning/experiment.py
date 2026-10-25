@@ -36,6 +36,9 @@ def environment_metadata():
             return None
 
     def git(*args):
+        # A pip-installed package must not report an unrelated enclosing repository.
+        if not (package_root.parent / ".git").exists():
+            return None
         try:
             return subprocess.check_output(
                 ["git", "-C", str(package_root.parent), *args],

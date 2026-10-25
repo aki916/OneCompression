@@ -288,6 +288,30 @@ def test_attention_requires_eager_and_adaptive_multitoken_rejected():
         )
 
 
+def test_progressive_requires_eager_before_any_forward():
+    model = ScriptedLM()
+    model.config._attn_implementation = "sdpa"
+    adapter = TransformersReasoningAdapter(model, TinyTokenizer())
+    with pytest.raises(ValueError, match="eager"):
+        adapter.generate(
+            [1], reasoning_format=FORMAT, config=ReasoningConfig(policy="progressive")
+        )
+    assert model.forward_lengths == []
+
+
+def test_probe_policy_accepts_multitoken_end_without_recording_margin():
+    model = ScriptedLM()
+    adapter = TransformersReasoningAdapter(model, TinyTokenizer())
+    result = adapter.generate(
+        [1],
+        reasoning_format=ReasoningFormat((2,), (3, 12)),
+        config=ReasoningConfig(policy="deer"),
+        max_new_tokens=30,
+    )
+    assert result.state.signals
+    assert all("logit_margin" not in signal for signal in result.state.signals)
+
+
 def test_asag_jump_and_bias_follow_normal_cache_path(monkeypatch):
     model = ScriptedLM()
     adapter = TransformersReasoningAdapter(model, TinyTokenizer())
