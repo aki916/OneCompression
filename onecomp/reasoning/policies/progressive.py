@@ -14,6 +14,7 @@ ATTENTION_BAND = 0.05
 
 class ProgressivePolicy(ReasoningPolicy):
     name = "progressive"
+    requires_logits = True
 
     @property
     def requires_attention(self):

@@ -8,6 +8,7 @@ from .base import ReasoningPolicy, has_cheap_stop
 
 class ThinkBrakePolicy(ReasoningPolicy):
     name = "thinkbrake"
+    requires_logits = True
 
     def decide(self, state, signals):
         return (

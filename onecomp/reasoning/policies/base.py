@@ -11,12 +11,14 @@ class ReasoningPolicy(ABC):
     """One stopping method. Class attributes declare what a backend must observe.
 
     ``uses_logits``: observe the output-logit margin at each boundary (no extra forward).
+    ``requires_logits``: ``decide`` consumes that margin, so it must be observable.
     ``uses_probe``: run an isolated answer probe at each boundary.
     ``requires_attention``: some probe may collect eager attention weights.
     """
 
     name = ""
     uses_logits = True
+    requires_logits = False
     uses_probe = False
     requires_attention = False
 
