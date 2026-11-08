@@ -22,6 +22,13 @@
   `policy="stability"` stops when consecutive trial answers agree. Probes reuse
   the request's KV cache and restore it exactly, and their cost is counted in
   `model_evaluated_tokens`. Transformers reference backend only.
+- **Attention-based reasoning policies (experimental)**: `policy="asag_reference"`
+  is a reference interpretation of ASAG that combines trial-answer confidence
+  with attention-entropy convergence and can bias the next token or jump to a
+  fresh approach; `policy="progressive"` is a OneComp cascade that pays for an
+  answer probe and then an attention probe only while cheaper signals are
+  inconclusive. Their attention signals need `attn_implementation="eager"`;
+  both run on the Transformers reference backend only.
 
 ## [v1.4.0] 2026-10-09
 

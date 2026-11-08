@@ -8,9 +8,10 @@ original or OneComp-quantized models.
 
 !!! warning "Research feature"
     This release provides the policy/controller API, the budget baselines,
-    ThinkBrake (reads only output logits) and the answer-probe policies DEER and
-    stability (Transformers reference backend only). Attention-based policies
-    are not included yet.
+    ThinkBrake (reads only output logits), the answer-probe policies DEER and
+    stability, and the attention-based ASAG reference and experimental
+    progressive cascade. Probe and attention policies run only on the
+    Transformers reference backend.
 
 ## Policies
 
@@ -22,6 +23,8 @@ original or OneComp-quantized models.
 | `thinkbrake` | at a boundary, the best non-end token's log-probability minus `</think>`'s ≤ `threshold` | none (reads logits decoding already produced) | Transformers, vLLM | [ThinkBrake](../reasoning-compression/papers.md#thinkbrake) |
 | `deer` | a trial answer's geometric-mean confidence > `confidence_threshold` | answer probe per boundary | Transformers | [DEER](../reasoning-compression/papers.md#deer) |
 | `stability` | `stability_window` identical trial answers in a row | answer probe per boundary | Transformers | [Dynasor-inspired](../reasoning-compression/papers.md#certaindex-dynasor) |
+| `asag_reference` | arithmetic confidence + attention-entropy change; may also bias the next token or jump | answer probe + eager attention per boundary | Transformers | [ASAG](../reasoning-compression/papers.md#asag) (reference interpretation) |
+| `progressive` | logits → answer probe → attention, escalating only while uncertain | lazy probes | Transformers | OneComp experimental |
 
 When a policy stops, the backend emits the model's own `</think>` marker through
 normal decoding and the model then writes its final answer. Budgets stop as soon
@@ -59,6 +62,29 @@ crops it back afterwards, so it skips re-reading the prefix; pass
 `probe_prefix_reuse=False` to the adapter to re-prefill every probe instead (the
 conservative cost reference). Reuse lowers model compute, but on a serial
 reference backend wall-clock latency is dominated by token-by-token decoding.
+
+`asag_reference` additionally reads attention weights during the probe, so the
+model must be loaded with `attn_implementation="eager"` (the adapter raises
+`ValueError` before any forward otherwise). Besides stopping, it can mix the
+trial answer's distribution into the next token (`bias`) or append a "Wait, my
+previous reasoning is not correct…" prompt (`jump`, at most `max_jumps` times).
+`asag_mode` selects ablations: `confidence` needs no attention and works with
+fused attention, `attention` skips trial-answer decoding, and `both` keeps the
+exit rule without the bias/jump actions. Eager attention changes numerics
+slightly, so a greedy trajectory can differ from the same model loaded with
+SDPA; compare policies under the same attention implementation.
+
+```python
+model = AutoModelForCausalLM.from_pretrained(..., attn_implementation="eager")
+config = ReasoningConfig(policy="asag_reference", boundary="transition")
+```
+
+`progressive` is a OneComp cascade, not a published method. It stops on a small
+ThinkBrake margin, runs an answer probe only when the margin lies in
+`(threshold, cascade_uncertainty]`, and adds an attention-only probe only when
+a complete answer's confidence is just below `confidence_threshold`. Like
+ThinkBrake, greedy margins can stay above `cascade_uncertainty`, in which case
+progressive never probes; widen the band on a development set.
 
 `prompt_budget` reads its budget from the config like `fixed`. Substitute the
 per-prompt value from `estimate_prompt_budget` for each request:
@@ -123,7 +149,7 @@ params = SamplingParams(
 
 Requests without the metadata are untouched, and each request in a batch keeps
 its own state. `none`, `fixed`, `prompt_budget` and `thinkbrake` are supported;
-probe policies raise `NotImplementedError`. The processor supports vLLM 0.21.x only (other versions raise
+probe and attention policies raise `NotImplementedError`. The processor supports vLLM 0.21.x only (other versions raise
 `RuntimeError` at construction, although the `vllm` extra allows
 `>=0.10,<0.22`) and rejects speculative decoding and `n > 1`.
 
@@ -133,12 +159,18 @@ probe policies raise `NotImplementedError`. The processor supports vLLM 0.21.x o
 |---|---|---|---|
 | `policy` | `"none"` | all | One of the policies above |
 | `budget` | `2048` | fixed, prompt_budget | Reasoning-token budget |
-| `threshold` | `0.1` | thinkbrake | Stop when the logit gap ≤ threshold |
-| `temperature` | `1.0` | thinkbrake | Divides the logit gap (ThinkBrake uses the sampling temperature, 0.6 for Qwen3) |
-| `confidence_threshold` | `0.95` | deer | Stop when probe confidence > threshold |
+| `threshold` | `0.1` | thinkbrake, progressive | Stop when the logit gap ≤ threshold |
+| `temperature` | `1.0` | thinkbrake, progressive | Divides the logit gap (ThinkBrake uses the sampling temperature, 0.6 for Qwen3) |
+| `confidence_threshold` | `0.95` | deer, asag, progressive | Stop when probe confidence > threshold |
 | `relative_confidence` | `False` | deer | Non-paper variant: also stop on a new confidence maximum |
 | `stability_window` | `3` | stability | Number of identical consecutive answers |
-| `probe_max_tokens` | `128` | deer, stability | Trial-answer length limit; truncated probes are never confident |
+| `probe_max_tokens` | `128` | probe policies | Trial-answer length limit; truncated probes are never confident |
+| `entropy_threshold` | `-0.1` | asag, progressive | Convergence: relative attention-entropy change below this |
+| `asag_mode` | `"full"` | asag, progressive | `full`, `confidence`, `attention` or `both` (see above) |
+| `enable_injection` | `True` | asag | Allow the probability-mixture (`bias`) action |
+| `enable_trap` | `True` | asag | Allow the backward-attention `jump` action |
+| `max_jumps` | `1` | asag | Jumps before a trap forces a stop |
+| `cascade_uncertainty` | `2.0` | progressive | Probe only when threshold < logit gap ≤ this |
 | `boundary` | `"sentence"` | adaptive policies | `sentence`, `transition` or `tokens` (budgets ignore it) |
 | `interval` | `128` | `boundary="tokens"` | Check every N reasoning tokens |
 | `min_reasoning_tokens` | `0` | adaptive policies | No adaptive check before this many reasoning tokens |

@@ -27,6 +27,8 @@ described in the [Reasoning Compression user guide](../user-guide/reasoning-comp
         - ThinkBrakePolicy
         - DeerPolicy
         - StabilityPolicy
+        - AsagPolicy
+        - ProgressivePolicy
 
 ## Signals
 
@@ -35,6 +37,12 @@ described in the [Reasoning Compression user guide](../user-guide/reasoning-comp
 ::: onecomp.reasoning.signals.logit_observation
 
 ::: onecomp.reasoning.signals.deer_confidence
+
+::: onecomp.reasoning.signals.asag_confidence
+
+::: onecomp.reasoning.signals.attention_statistics
+
+::: onecomp.reasoning.signals.relative_entropy_change
 
 ## Backends
 
