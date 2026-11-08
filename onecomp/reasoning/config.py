@@ -31,6 +31,7 @@ class ReasoningConfig:
     stability_window: int = 3
     enable_injection: bool = True
     enable_trap: bool = True
+    cascade_uncertainty: float = 2.0
     asag_mode: str = "full"
     relative_confidence: bool = False
 
@@ -49,7 +50,13 @@ class ReasoningConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        for name in ("threshold", "confidence_threshold", "temperature", "entropy_threshold"):
+        for name in (
+            "threshold",
+            "confidence_threshold",
+            "temperature",
+            "entropy_threshold",
+            "cascade_uncertainty",
+        ):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
@@ -61,6 +68,8 @@ class ReasoningConfig:
             raise ValueError("confidence_threshold must be in [0, 1]")
         if self.temperature <= 0:
             raise ValueError("temperature must be positive")
+        if self.policy == "progressive" and self.cascade_uncertainty < self.threshold:
+            raise ValueError("cascade_uncertainty must be at least threshold")
         for name in ("enable_injection", "enable_trap", "relative_confidence"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")

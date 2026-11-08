@@ -136,7 +136,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(s.signals), 1)
 
     def test_incomplete_probes_never_imply_confidence_or_stability(self):
-        for policy in ("deer", "stability", "asag_reference"):
+        for policy in ("deer", "stability", "asag_reference", "progressive"):
             c = ReasoningCompressionController(
                 ReasoningConfig(
                     policy=policy,
@@ -221,6 +221,27 @@ class CoreTests(unittest.TestCase):
             "continue",
         )
 
+    def test_progressive_probes_only_an_uncertain_margin(self):
+        c = ReasoningCompressionController(
+            ReasoningConfig(policy="progressive", threshold=0.1, cascade_uncertainty=2.0)
+        )
+        s = RequestState("a", ReasoningFormat((10,), (20,)))
+        self.assertFalse(c.needs_probe(s, {"logit_margin": 0.05}))
+        self.assertTrue(c.needs_probe(s, {"logit_margin": 1.0}))
+        self.assertFalse(c.needs_probe(s, {"logit_margin": 3.0}))
+        self.assertFalse(c.needs_probe(s, {"logit_margin": None}))
+        self.assertEqual(c.decide(s, {"logit_margin": 0.05}).reason, "cascade_logits")
+
+    def test_missing_entropy_in_progressive_is_not_convergence(self):
+        c = ReasoningCompressionController(ReasoningConfig(policy="progressive"))
+        s = RequestState("a", ReasoningFormat((10,), (20,)))
+        self.assertEqual(
+            c.decide(s, {"confidence": 0.92, "relative_entropy": None}).kind, "continue"
+        )
+
+    def test_thinkbrake_threshold_sweep_is_not_limited_by_cascade(self):
+        self.assertEqual(ReasoningConfig(policy="thinkbrake", threshold=10).threshold, 10)
+
     def test_logit_mixture_and_jump_actions(self):
         logits = torch.tensor([2.0, 1.0, 0.0])
         probe = torch.tensor([0.0, 0.0, 1.0])
@@ -290,6 +311,8 @@ class CoreTests(unittest.TestCase):
             {"max_jumps": -1},
             {"entropy_threshold": float("nan")},
             {"enable_trap": 1},
+            {"cascade_uncertainty": float("nan")},
+            {"policy": "progressive", "threshold": 3.0},
         ):
             with self.assertRaises((ValueError, TypeError)):
                 ReasoningConfig.from_dict(values)

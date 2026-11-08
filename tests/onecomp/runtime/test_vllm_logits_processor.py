@@ -177,7 +177,7 @@ def test_thinkbrake_rejects_multitoken_end():
         )
 
 
-@pytest.mark.parametrize("policy", ["deer", "stability", "asag_reference"])
+@pytest.mark.parametrize("policy", ["deer", "stability", "asag_reference", "progressive"])
 def test_probe_policies_are_rejected(policy):
     with pytest.raises(NotImplementedError, match="logits hooks"):
         VLLMReasoningAdapter.extra_args(ReasoningConfig(policy=policy), FORMAT)

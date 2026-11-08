@@ -468,3 +468,49 @@ def test_mixture_distribution_is_first_answer_content_position():
     assert result.token_ids[:3] == [8, 6, 9]
     # Not the distribution right after the cue, which predicts the "{" delimiter.
     assert int(result.first_distribution.argmax()) == 6
+
+
+def test_progressive_requires_eager_before_any_forward():
+    model = ScriptedLM()
+    model.config._attn_implementation = "sdpa"
+    adapter = TransformersReasoningAdapter(model, TinyTokenizer())
+    with pytest.raises(ValueError, match="eager"):
+        adapter.generate(
+            [1], reasoning_format=FORMAT, config=ReasoningConfig(policy="progressive")
+        )
+    assert model.forward_lengths == []
+
+
+def test_progressive_attention_is_lazy_and_charges_its_extra_prefill(monkeypatch):
+    model = ScriptedLM()
+    adapter = TransformersReasoningAdapter(model, TinyTokenizer())
+    original_probe = adapter.probe
+
+    def uncertain_probe(*args, **kwargs):
+        result = original_probe(*args, **kwargs)
+        if kwargs.get("answer_probe", True):
+            result.confidence = 0.92
+            result.signals["confidence"] = 0.92
+        return result
+
+    monkeypatch.setattr(adapter, "probe", uncertain_probe)
+    result = adapter.generate(
+        [1],
+        reasoning_format=FORMAT,
+        config=ReasoningConfig(
+            policy="progressive",
+            boundary="tokens",
+            interval=2,
+            threshold=0.1,
+            cascade_uncertainty=20.0,
+            probe_max_tokens=6,
+        ),
+        max_new_tokens=20,
+    )
+    assert result.state.signals[0]["cascade_attention_requested"]
+    traces = result.metrics["probe_history"]
+    assert not traces[0]["attention_observed"] and traces[1]["attention_observed"]
+    assert result.metrics["probe_model_evaluated_tokens"] == sum(
+        t["model_evaluated_tokens"] for t in traces
+    )
+    assert result.metrics["model_evaluated_tokens"] == sum(model.forward_lengths)

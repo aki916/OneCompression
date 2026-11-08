@@ -6,6 +6,7 @@ from .asag import AsagPolicy
 from .base import NonePolicy, ReasoningPolicy
 from .budget import BudgetPolicy
 from .deer import DeerPolicy
+from .progressive import ProgressivePolicy
 from .stability import StabilityPolicy
 from .thinkbrake import ThinkBrakePolicy
 
@@ -17,6 +18,7 @@ POLICIES = {
     "deer": DeerPolicy,
     "stability": StabilityPolicy,
     "asag_reference": AsagPolicy,
+    "progressive": ProgressivePolicy,
 }
 
 
@@ -30,6 +32,7 @@ __all__ = [
     "BudgetPolicy",
     "DeerPolicy",
     "NonePolicy",
+    "ProgressivePolicy",
     "ReasoningPolicy",
     "StabilityPolicy",
     "ThinkBrakePolicy",

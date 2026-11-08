@@ -39,6 +39,8 @@ ASAG_JUMP = (
     "Wait, my previous reasoning is not correct. I should adopt a more concise "
     "and different approach to reexamine this problem.\n\n"
 )
+# Probe signal keys that a lazily added attention probe must not overwrite.
+_ANSWER_PROBE_KEYS = frozenset({"confidence", "answer", "probe_complete", "probe_cue"})
 
 
 @dataclass
@@ -342,7 +344,26 @@ class TransformersReasoningAdapter:
             cache=cache,
             **policy.probe_options(),
         )
-        return main, dict(main.signals), [main]
+        observation = dict(main.signals)
+        charged = [main]
+        # Progressive cascade: pay for attention only after an ambiguous complete probe.
+        if policy.needs_attention_followup(main):
+            attention = self.probe(
+                prefix_ids,
+                config,
+                previous_span=previous_span,
+                current_span=current_span,
+                collect_attention=True,
+                answer_probe=False,
+                cache=cache,
+            )
+            charged.append(attention)
+            observation.update(
+                {k: v for k, v in attention.signals.items() if k not in _ANSWER_PROBE_KEYS}
+            )
+            observation["attention_probe_cue"] = attention.signals["probe_cue"]
+            observation["cascade_attention_requested"] = True
+        return main, observation, charged
 
     @torch.inference_mode()
     def generate(
